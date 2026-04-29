@@ -11,16 +11,23 @@ shape of the sibling echr-api / uhri-dataset-api on the same VM.
   GET /api/document/{doc_id}            full document (all paragraphs)
   GET /api/paragraph/{para_id}          single paragraph + parent doc
   GET /api/browse                       paginated catalogue list
+  POST /api/feedback                    write-side: report a problem
 
 CORS is permissive for the GH-Pages origin
 (https://lszoszk.github.io). Tighten / parameterise if we ever expose
 this anywhere else.
 
 Environment:
-  UNHRDB_DB_PATH   default /data/unhrdb.sqlite3
-  UNHRDB_VERSION   tag string surfaced in /health and /api/stats
+  UNHRDB_DB_PATH       default /data/unhrdb.sqlite3
+  UNHRDB_FEEDBACK_DIR  default /feedback
+  UNHRDB_VERSION       tag string surfaced in /health and /api/stats
+
+Note: we deliberately do NOT use `from __future__ import annotations`
+in this file. FastAPI + pydantic 2 + slowapi together cannot resolve
+ForwardRef'd type hints when the limiter wraps the function, even when
+the class is declared earlier in the module. Keeping annotations
+evaluated eagerly side-steps the issue cleanly.
 """
-from __future__ import annotations
 
 import json
 import os
@@ -29,7 +36,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
@@ -66,6 +73,18 @@ DB_PATH = os.getenv("UNHRDB_DB_PATH", "/data/unhrdb.sqlite3")
 FEEDBACK_DIR = os.getenv("UNHRDB_FEEDBACK_DIR", "/feedback")
 APP_VERSION = os.getenv("UNHRDB_VERSION", "v18-sprint2")
 
+# Pydantic body model for /api/feedback. Declared at module top so
+# FastAPI can fully resolve the type when it builds the OpenAPI schema
+# (a ForwardRef to a class declared further down breaks pydantic 2's
+# strict schema-building, even with Body() annotation).
+class FeedbackBody(BaseModel):
+    kind: str = Field(..., max_length=32)         # "bug" | "data" | "feature" | "other"
+    paraId: Optional[str] = Field(None, max_length=200)
+    docId: Optional[str] = Field(None, max_length=200)
+    message: str = Field(..., min_length=4, max_length=2000)
+    contact: Optional[str] = Field(None, max_length=120)
+
+
 app = FastAPI(
     title="UN Human Rights Database API",
     version=APP_VERSION,
@@ -99,10 +118,18 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 @contextmanager
 def db_cursor():
-    # Open in read-only mode via the URI scheme — guarantees the API
-    # cannot mutate the DB even if a future endpoint is buggy.
+    # Read-only via URI mode=ro AND immutable=1.
+    # ─ mode=ro alone fails on a :ro bind mount because SQLite still
+    #   tries to create -shm / -wal side files for WAL bookkeeping
+    #   (the DB was built with journal_mode=WAL, leaving a WAL marker
+    #    in the file even after a clean close).
+    # ─ immutable=1 tells SQLite the file will never change during the
+    #   connection's lifetime, so it skips all WAL/SHM management. This
+    #   is exactly true for our deploy model (we rebuild the DB locally
+    #   and rsync it; the container is restarted).
     conn = sqlite3.connect(
-        f"file:{DB_PATH}?mode=ro", uri=True, check_same_thread=False
+        f"file:{DB_PATH}?mode=ro&immutable=1",
+        uri=True, check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
     try:
@@ -514,20 +541,17 @@ def browse(
 
 # ---------------------------------------------------------------------------
 # /api/feedback — minimal write endpoint for the "report a problem" flow.
-# Persists to a single jsonl file alongside the DB. Tight rate limit
-# because write paths are abuse-prone.
+# Persists to a single jsonl file in the writable mount. Tight rate
+# limit (5/hour/IP) because write paths are abuse-prone. The Pydantic
+# body model is declared at the top of this file so OpenAPI schema
+# resolution doesn't choke on ForwardRef.
 # ---------------------------------------------------------------------------
-class FeedbackBody(BaseModel):
-    kind: str = Field(..., max_length=32)         # "bug" | "data" | "feature" | "other"
-    paraId: Optional[str] = Field(None, max_length=200)
-    docId: Optional[str] = Field(None, max_length=200)
-    message: str = Field(..., min_length=4, max_length=2000)
-    contact: Optional[str] = Field(None, max_length=120)
-
-
 @app.post("/api/feedback")
 @limiter.limit("5/hour")
-def post_feedback(request: Request, body: FeedbackBody):
+def post_feedback(request: Request, body: FeedbackBody = Body(...)):
+    # `Body(...)` is required because slowapi wraps the handler in
+    # functools.wraps before FastAPI introspects the signature; without
+    # it FastAPI reads `body` as a query parameter and rejects the JSON.
     os.makedirs(FEEDBACK_DIR, exist_ok=True)
     record = {
         "ts":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

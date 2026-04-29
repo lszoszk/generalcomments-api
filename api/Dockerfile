@@ -12,8 +12,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App sources.
-COPY main.py ranking.py ./
+# App sources. We copy all .py files at the api/ root (main, ranking,
+# synonyms, build_db) — keeping the surface explicit prevents tests/
+# and __pycache__ from sneaking in. build_db.py isn't needed in the
+# image but it's tiny; leaving it lets us re-build the DB inside the
+# running container if we ever want to (`docker exec unhrdb-api python
+# build_db.py`).
+COPY main.py ranking.py synonyms.py build_db.py ./
 
 # The DB is mounted in via docker-compose at /data; the env var below is
 # the same default the code uses.  We set it here for clarity / docs.
