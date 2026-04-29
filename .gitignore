@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+
+# The DB and manifest are build artefacts — checked in via deploy
+# (scp'd to VM), not via git.
+data/unhrdb.sqlite3
+data/unhrdb.sqlite3-shm
+data/unhrdb.sqlite3-wal
+data/manifest.json
