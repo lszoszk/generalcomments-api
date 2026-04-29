@@ -11,9 +11,14 @@ services:
       # SQLite + manifest live in ./data on the host. Mount read-only;
       # the API uses ?mode=ro for sqlite3.connect() too, defence in depth.
       - ./data:/data:ro
+      # Sprint 2: writable directory for /api/feedback jsonl. Kept
+      # separate from /data so the DB stays strictly read-only — the only
+      # file the container can mutate is the feedback log.
+      - ./feedback:/feedback
     restart: unless-stopped
     mem_limit: 512m
     mem_reservation: 128m
     environment:
       - UNHRDB_DB_PATH=/data/unhrdb.sqlite3
-      - UNHRDB_VERSION=v17-sprint1
+      - UNHRDB_FEEDBACK_DIR=/feedback
+      - UNHRDB_VERSION=v18-sprint2

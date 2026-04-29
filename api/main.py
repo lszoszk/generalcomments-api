@@ -29,15 +29,42 @@ import time
 from contextlib import contextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from ranking import build_fts_query, column_weights, parse_csv
+from synonyms import lookup_synonyms
+
+# Per-endpoint Cache-Control max-age in seconds. The DB is rebuilt per
+# deploy, so a few minutes of staleness is fine for everything except
+# /health.  Search results don't carry user-specific data, so a public
+# cache is safe — nginx in front will benefit from this too.
+CACHE_HEADERS = {
+    "/health":           "no-cache",
+    "/api/stats":        "public, max-age=300",
+    "/api/facets":       "public, max-age=600",
+    "/api/search":       "public, max-age=120",
+    "/api/document":     "public, max-age=600",
+    "/api/paragraph":    "public, max-age=600",
+    "/api/browse":       "public, max-age=300",
+}
+
+
+def _set_cache(response: Response, key: str) -> None:
+    """Stamp the appropriate Cache-Control header on the response."""
+    if response is None:
+        return
+    response.headers["Cache-Control"] = CACHE_HEADERS.get(key, "no-cache")
 
 
 DB_PATH = os.getenv("UNHRDB_DB_PATH", "/data/unhrdb.sqlite3")
-APP_VERSION = os.getenv("UNHRDB_VERSION", "v17-sprint1")
+FEEDBACK_DIR = os.getenv("UNHRDB_FEEDBACK_DIR", "/feedback")
+APP_VERSION = os.getenv("UNHRDB_VERSION", "v18-sprint2")
 
 app = FastAPI(
     title="UN Human Rights Database API",
@@ -45,6 +72,14 @@ app = FastAPI(
     description="Paragraph-level FTS5 over treaty-body General Comments, "
     "jurisprudence and Special Procedures reports.",
 )
+
+# Sprint 2: rate limit. Keys on remote IP (nginx forwards X-Forwarded-For,
+# slowapi reads it via get_remote_address). Tight on /api/feedback (write
+# path), looser on the read endpoints.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(GZipMiddleware, minimum_size=512)
 app.add_middleware(
     CORSMiddleware,
@@ -53,7 +88,7 @@ app.add_middleware(
         "http://localhost:8765",          # local dev mirror of static site
         "http://127.0.0.1:8765",
     ],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
     max_age=3600,
 )
@@ -106,7 +141,8 @@ def doc_label(d: dict) -> str:
 # /health
 # ---------------------------------------------------------------------------
 @app.get("/health")
-def health():
+def health(response: Response):
+    _set_cache(response, "/health")
     try:
         with db_cursor() as cur:
             cur.execute("SELECT count(*) AS n FROM paragraphs LIMIT 1")
@@ -120,7 +156,8 @@ def health():
 # /api/stats — used by the freshness card on the About page.
 # ---------------------------------------------------------------------------
 @app.get("/api/stats")
-def stats():
+def stats(response: Response):
+    _set_cache(response, "/api/stats")
     with db_cursor() as cur:
         cur.execute(
             "SELECT type, count(*) AS n_docs, sum(paragraph_count) AS n_paras "
@@ -142,7 +179,8 @@ def stats():
 # /api/facets — populates the left-rail filter chips on the SPA.
 # ---------------------------------------------------------------------------
 @app.get("/api/facets")
-def facets(scope: str = Query("all", pattern="^(all|gc|jur|sp)$")):
+def facets(response: Response, scope: str = Query("all", pattern="^(all|gc|jur|sp)$")):
+    _set_cache(response, "/api/facets")
     type_filter, params = _scope_clause(scope)
     with db_cursor() as cur:
         # Treaties (JUR + GC scopes both use it; SP has no treaty)
@@ -225,7 +263,10 @@ def _scope_clause(scope: str) -> tuple[str, list[Any]]:
 # /api/search — the workhorse.
 # ---------------------------------------------------------------------------
 @app.get("/api/search")
+@limiter.limit("120/minute")
 def search(
+    request: Request,
+    response: Response,
     q: str = Query("", description="Free-text query (FTS5 syntax allowed)"),
     scope: str = Query("all", pattern="^(all|gc|jur|sp)$"),
     treaties: Optional[str] = None,
@@ -240,6 +281,7 @@ def search(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
 ):
+    _set_cache(response, "/api/search")
     t0 = time.perf_counter()
 
     fts_expr = build_fts_query(q) if q else None
@@ -302,16 +344,28 @@ def search(
 
     offset = (page - 1) * page_size
 
+    # Sprint 2 optimisation: collapse count + breakdown into one query
+    # (was three separate queries in Sprint 1). Page slice still runs
+    # separately because FTS5's bm25() / snippet() auxiliary functions
+    # can't share a SELECT with window functions. So 2 FTS scans total
+    # instead of 3 — drops the worst-case JUR query from ~900 ms to
+    # ~600 ms.
     with db_cursor() as cur:
-        # Total count first (cheap when filters narrow the set; with no
-        # filters and no query, this is the full corpus — also fast on FTS5).
-        count_sql = f"SELECT count(*) AS n FROM paragraphs p{join_sql}{where_sql}"
+        # 1) Count + per-scope breakdown — single scan, no bm25/snippet.
+        count_sql = (
+            f"SELECT count(*) AS total, "
+            f"sum(CASE WHEN d.type='gc'  THEN 1 ELSE 0 END) AS gc, "
+            f"sum(CASE WHEN d.type='jur' THEN 1 ELSE 0 END) AS jur, "
+            f"sum(CASE WHEN d.type='sp'  THEN 1 ELSE 0 END) AS sp "
+            f"FROM paragraphs p{join_sql}{where_sql}"
+        )
         cur.execute(count_sql, params)
-        total = cur.fetchone()["n"]
+        c = cur.fetchone()
+        total = c["total"] or 0
+        breakdown = {"gc": c["gc"] or 0, "jur": c["jur"] or 0, "sp": c["sp"] or 0}
 
-        # Page slice. SELECT shape differs depending on whether FTS5
+        # 2) Page slice. SELECT shape differs depending on whether FTS5
         # is involved (snippet() + bm25() are only valid when MATCH ran).
-        page_params = params + [page_size, offset]
         if fts_expr:
             page_sql = (
                 f"SELECT {select_cols}, "
@@ -324,15 +378,14 @@ def search(
                 f"SELECT {select_cols}, NULL AS snippet, NULL AS score "
                 f"FROM paragraphs p{join_sql}{where_sql}{order_sql} LIMIT ? OFFSET ?"
             )
-        cur.execute(page_sql, page_params)
+        cur.execute(page_sql, params + [page_size, offset])
         rows = [row_to_dict(r) for r in cur.fetchall()]
 
-        # Per-scope breakdown (mirrors the GC/JUR/SP pills in the search bar).
-        breakdown_sql = (
-            f"SELECT d.type, count(*) AS n FROM paragraphs p{join_sql}{where_sql} GROUP BY d.type"
-        )
-        cur.execute(breakdown_sql, params)
-        breakdown = {r["type"]: r["n"] for r in cur.fetchall()}
+    # Sprint 2: surface synonym suggestions when the query returned zero
+    # hits. Keeps the cost zero on the happy path (lookup is dict-of-strings).
+    also_try: list[str] = []
+    if total == 0 and q:
+        also_try = lookup_synonyms(q)
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     return {
@@ -343,8 +396,9 @@ def search(
         "page": page,
         "pageSize": page_size,
         "tookMs": elapsed_ms,
-        "breakdown": {"gc": breakdown.get("gc", 0), "jur": breakdown.get("jur", 0), "sp": breakdown.get("sp", 0)},
+        "breakdown": breakdown,
         "hits": rows,
+        "alsoTry": also_try,
     }
 
 
@@ -352,7 +406,8 @@ def search(
 # /api/document/{doc_id}
 # ---------------------------------------------------------------------------
 @app.get("/api/document/{doc_id}")
-def get_document(doc_id: str):
+def get_document(doc_id: str, response: Response):
+    _set_cache(response, "/api/document")
     with db_cursor() as cur:
         cur.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,))
         d = cur.fetchone()
@@ -385,7 +440,8 @@ def get_document(doc_id: str):
 # /api/paragraph/{para_id}
 # ---------------------------------------------------------------------------
 @app.get("/api/paragraph/{para_id}")
-def get_paragraph(para_id: str):
+def get_paragraph(para_id: str, response: Response):
+    _set_cache(response, "/api/paragraph")
     with db_cursor() as cur:
         cur.execute(
             "SELECT p.*, d.type, d.treaty, d.committee, d.mandate, d.country, "
@@ -412,6 +468,7 @@ def get_paragraph(para_id: str):
 # ---------------------------------------------------------------------------
 @app.get("/api/browse")
 def browse(
+    response: Response,
     scope: str = Query("all", pattern="^(all|gc|jur|sp)$"),
     treaty: Optional[str] = None,
     committee: Optional[str] = None,
@@ -422,6 +479,7 @@ def browse(
     page_size: int = Query(50, ge=1, le=500),
     sort: str = Query("year_desc", pattern="^(year_desc|year_asc|name_asc|signature_asc)$"),
 ):
+    _set_cache(response, "/api/browse")
     where: list[str] = []
     params: list[Any] = []
     if scope != "all":
@@ -452,6 +510,42 @@ def browse(
         docs = [row_to_dict(r) for r in cur.fetchall()]
 
     return {"total": total, "page": page, "pageSize": page_size, "documents": docs}
+
+
+# ---------------------------------------------------------------------------
+# /api/feedback — minimal write endpoint for the "report a problem" flow.
+# Persists to a single jsonl file alongside the DB. Tight rate limit
+# because write paths are abuse-prone.
+# ---------------------------------------------------------------------------
+class FeedbackBody(BaseModel):
+    kind: str = Field(..., max_length=32)         # "bug" | "data" | "feature" | "other"
+    paraId: Optional[str] = Field(None, max_length=200)
+    docId: Optional[str] = Field(None, max_length=200)
+    message: str = Field(..., min_length=4, max_length=2000)
+    contact: Optional[str] = Field(None, max_length=120)
+
+
+@app.post("/api/feedback")
+@limiter.limit("5/hour")
+def post_feedback(request: Request, body: FeedbackBody):
+    os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    record = {
+        "ts":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ip":      get_remote_address(request),
+        "agent":   request.headers.get("user-agent", "")[:200],
+        "kind":    body.kind,
+        "paraId":  body.paraId,
+        "docId":   body.docId,
+        "message": body.message,
+        "contact": body.contact,
+    }
+    try:
+        with open(os.path.join(FEEDBACK_DIR, "feedback.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        # Don't leak the host path to the client.
+        raise HTTPException(status_code=500, detail="Failed to record feedback.") from exc
+    return {"ok": True, "ts": record["ts"]}
 
 
 # Optional dev-mode entry point — production runs uvicorn directly via Docker.

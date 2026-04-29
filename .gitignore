@@ -10,3 +10,10 @@ data/unhrdb.sqlite3
 data/unhrdb.sqlite3-shm
 data/unhrdb.sqlite3-wal
 data/manifest.json
+
+# Runtime data
+feedback/feedback.jsonl
+
+# Pytest artefacts
+api/.pytest_cache/
+api/tests/__pycache__/
