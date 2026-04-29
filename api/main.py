@@ -296,6 +296,13 @@ def search(
     response: Response,
     q: str = Query("", description="Free-text query (FTS5 syntax allowed)"),
     scope: str = Query("all", pattern="^(all|gc|jur|sp)$"),
+    body: Optional[str] = Query(
+        None,
+        description="Treaty body / committee / mandate union — matches when ANY "
+        "of documents.treaty, documents.committee, or documents.mandate is in "
+        "the comma-separated list. Use this for the frontend's filter chips "
+        "where the same value (e.g. 'CRPD') maps to GC committee + JUR treaty.",
+    ),
     treaties: Optional[str] = None,
     committees: Optional[str] = None,
     mandates: Optional[str] = None,
@@ -312,6 +319,7 @@ def search(
     t0 = time.perf_counter()
 
     fts_expr = build_fts_query(q) if q else None
+    body_list = parse_csv(body)
     treaty_list = parse_csv(treaties)
     committee_list = parse_csv(committees)
     mandate_list = parse_csv(mandates)
@@ -343,6 +351,20 @@ def search(
         ph = ",".join("?" for _ in values)
         where.append(f"{col} IN ({ph})")
         params.extend(values)
+
+    # The `body=` union: matches when ANY of treaty/committee/mandate is in
+    # the supplied list. The strict per-column slots below stack on TOP
+    # of this with AND, so power users can still narrow further if they
+    # want to.
+    if body_list:
+        ph = ",".join("?" for _ in body_list)
+        where.append(
+            f"(d.treaty IN ({ph}) OR d.committee IN ({ph}) OR d.mandate IN ({ph}))"
+        )
+        # Same list bound three times for the three IN clauses.
+        params.extend(body_list)
+        params.extend(body_list)
+        params.extend(body_list)
 
     if treaty_list:    in_clause("d.treaty", treaty_list)
     if committee_list: in_clause("d.committee", committee_list)

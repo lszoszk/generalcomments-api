@@ -68,6 +68,28 @@ def test_search_year_filter(client):
     assert all(h["year"] == 2018 for h in body["hits"])
 
 
+def test_search_body_union_filter(client):
+    """body=CRPD should match BOTH the GC doc (committee=CRPD) and the
+    JUR doc (treaty=CRPD) — the per-column slots OR'd together. This is
+    the bug v19.4 fixes: lumping the value into committees+treaties+
+    mandates as separate AND'd IN clauses leaves the JUR row out
+    because mandate is NULL."""
+    r = client.get("/api/search?q=accommodation&body=CRPD")
+    body = r.json()
+    # Fixture has: GC ¶1+¶2 (CRPD/committee=CRPD) + JUR ¶1 (CRPD/treaty=CRPD)
+    # all mention "accommodation". Total should be ≥ 3.
+    assert body["total"] >= 3
+    types = {h["type"] for h in body["hits"]}
+    assert "gc" in types
+    assert "jur" in types
+
+
+def test_search_body_union_only_one_kind(client):
+    """body=Spain hits nothing on treaty/committee/mandate — return zero."""
+    r = client.get("/api/search?q=accommodation&body=Spain")
+    assert r.json()["total"] == 0
+
+
 def test_search_synonyms_when_no_hits(client):
     r = client.get("/api/search?q=AI+bias")
     body = r.json()
