@@ -168,6 +168,30 @@ Bump it on each deploy. The DB itself is rebuilt fresh per deploy
 invalidate its cached facet/year-histogram state when the corpus
 changes.
 
+## Feedback / GitHub Issues forwarding (v19.14)
+
+`/api/feedback` accepts paragraph-scoped reports from the frontend's
+flag-button affordance and persists them to
+`/feedback/feedback.jsonl` (durable). When two env vars are set, it
+ALSO files a GitHub Issue per submission for triage convenience:
+
+```bash
+# In the VM operator's shell before `docker compose up -d`:
+export GITHUB_FEEDBACK_TOKEN="ghp_…"      # PAT, scope: repo (issues:write)
+export GITHUB_FEEDBACK_REPO="lszoszk/generalcomments-feedback"
+docker compose up -d
+```
+
+The token never appears in container env via the image — it's
+injected via the host shell, read once at startup. Failure to file
+an issue (token expired, GitHub down, network blocked) does NOT fail
+the user-facing request: the jsonl log is the source of truth.
+
+To rotate: revoke the old token on GitHub, update the env var on the
+VM, `docker compose up -d` (recreates with fresh env). Issues filed
+during the gap stay in the local jsonl — replay them from the log if
+you want them to land on GitHub retroactively.
+
 ## License
 
 Same as the parent project.

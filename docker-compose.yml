@@ -21,4 +21,10 @@ services:
     environment:
       - UNHRDB_DB_PATH=/data/unhrdb.sqlite3
       - UNHRDB_FEEDBACK_DIR=/feedback
-      - UNHRDB_VERSION=v18-sprint2
+      - UNHRDB_VERSION=v19.14
+      # v19.14: GitHub Issues forwarding for /api/feedback. Set the
+      # token via the host shell (e.g. `export GITHUB_FEEDBACK_TOKEN=…`)
+      # before `docker compose up -d`. Without a token the endpoint
+      # still works — just no GitHub copy.
+      - GITHUB_FEEDBACK_TOKEN=${GITHUB_FEEDBACK_TOKEN:-}
+      - GITHUB_FEEDBACK_REPO=${GITHUB_FEEDBACK_REPO:-lszoszk/generalcomments-feedback}
