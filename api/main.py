@@ -31,7 +31,9 @@ evaluated eagerly side-steps the issue cleanly.
 
 import json
 import os
+import re
 import sqlite3
+import sys
 import time
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -73,16 +75,44 @@ DB_PATH = os.getenv("UNHRDB_DB_PATH", "/data/unhrdb.sqlite3")
 FEEDBACK_DIR = os.getenv("UNHRDB_FEEDBACK_DIR", "/feedback")
 APP_VERSION = os.getenv("UNHRDB_VERSION", "v18-sprint2")
 
+# v19.14: GitHub Issues forwarding for /api/feedback. Set both env vars
+# to enable; with either missing, feedback persists to the jsonl log
+# only and the response says so. Kept optional so local-dev runs (no
+# token) continue to work.
+GITHUB_TOKEN = os.getenv("GITHUB_FEEDBACK_TOKEN", "").strip()
+GITHUB_REPO  = os.getenv("GITHUB_FEEDBACK_REPO", "lszoszk/generalcomments-feedback").strip()
+
+# Category → readable label + GitHub label slug. Six items per the
+# v19.14 UX spec; "other" is the catch-all. Anything outside this set
+# is silently bucketed as "other".
+FEEDBACK_CATEGORIES = {
+    "wrong-text":  ("Wrong text / typo",                "wrong-text"),
+    "wrong-fn":    ("Missing or wrong footnote",        "wrong-footnote"),
+    "wrong-label": ("Wrong concerned-group label",      "wrong-label"),
+    "wrong-meta":  ("Wrong metadata",                   "wrong-metadata"),
+    "wrong-link":  ("Wrong link to OHCHR original",     "wrong-link"),
+    "other":       ("Other",                            "other"),
+}
+
 # Pydantic body model for /api/feedback. Declared at module top so
 # FastAPI can fully resolve the type when it builds the OpenAPI schema
 # (a ForwardRef to a class declared further down breaks pydantic 2's
 # strict schema-building, even with Body() annotation).
 class FeedbackBody(BaseModel):
-    kind: str = Field(..., max_length=32)         # "bug" | "data" | "feature" | "other"
+    # v19.14: 6-category taxonomy plus optional message + auto-captured
+    # browser context. Older clients still post {kind, message, paraId,
+    # docId, contact} — we accept both shapes (extra fields ignored).
+    kind: str = Field(..., max_length=32)
     paraId: Optional[str] = Field(None, max_length=200)
     docId: Optional[str] = Field(None, max_length=200)
-    message: str = Field(..., min_length=4, max_length=2000)
+    signature: Optional[str] = Field(None, max_length=200)
+    message: Optional[str] = Field(None, max_length=2000)
     contact: Optional[str] = Field(None, max_length=120)
+    view: Optional[str] = Field(None, max_length=32)
+    url: Optional[str] = Field(None, max_length=500)
+    query: Optional[str] = Field(None, max_length=300)
+    scope: Optional[str] = Field(None, max_length=32)
+    excerpt: Optional[str] = Field(None, max_length=400)
 
 
 app = FastAPI(
@@ -569,21 +599,29 @@ def browse(
 # resolution doesn't choke on ForwardRef.
 # ---------------------------------------------------------------------------
 @app.post("/api/feedback")
-@limiter.limit("5/hour")
+@limiter.limit("10/hour")
 def post_feedback(request: Request, body: FeedbackBody = Body(...)):
     # `Body(...)` is required because slowapi wraps the handler in
     # functools.wraps before FastAPI introspects the signature; without
     # it FastAPI reads `body` as a query parameter and rejects the JSON.
     os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    cat_key = body.kind if body.kind in FEEDBACK_CATEGORIES else "other"
+    cat_label, cat_slug = FEEDBACK_CATEGORIES[cat_key]
     record = {
-        "ts":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "ip":      get_remote_address(request),
-        "agent":   request.headers.get("user-agent", "")[:200],
-        "kind":    body.kind,
-        "paraId":  body.paraId,
-        "docId":   body.docId,
-        "message": body.message,
-        "contact": body.contact,
+        "ts":        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ip":        get_remote_address(request),
+        "agent":     request.headers.get("user-agent", "")[:200],
+        "kind":      cat_key,
+        "paraId":    body.paraId,
+        "docId":     body.docId,
+        "signature": body.signature,
+        "view":      body.view,
+        "url":       body.url,
+        "query":     body.query,
+        "scope":     body.scope,
+        "excerpt":   body.excerpt,
+        "message":   body.message,
+        "contact":   body.contact,
     }
     try:
         with open(os.path.join(FEEDBACK_DIR, "feedback.jsonl"), "a", encoding="utf-8") as f:
@@ -591,7 +629,90 @@ def post_feedback(request: Request, body: FeedbackBody = Body(...)):
     except Exception as exc:
         # Don't leak the host path to the client.
         raise HTTPException(status_code=500, detail="Failed to record feedback.") from exc
-    return {"ok": True, "ts": record["ts"]}
+
+    # Best-effort GitHub Issue creation. Failure to file an issue does not
+    # fail the whole request — the local jsonl record is the durable
+    # store, the GitHub copy is for triage convenience.
+    issue_number = None
+    issue_url = None
+    if GITHUB_TOKEN and GITHUB_REPO:
+        issue_number, issue_url = _file_github_issue(record, cat_label, cat_slug)
+    return {
+        "ok": True,
+        "ts": record["ts"],
+        "issueNumber": issue_number,
+        "issueUrl": issue_url,
+    }
+
+
+def _file_github_issue(record: dict, cat_label: str, cat_slug: str):
+    """Create an issue at $GITHUB_FEEDBACK_REPO. Returns (number, url) or
+    (None, None) on any failure. We do NOT raise — the user already saw
+    their feedback persisted to the durable jsonl log."""
+    sig = record.get("signature") or record.get("docId") or "?"
+    paraN = ""
+    if record.get("paraId"):
+        # Pull the trailing 4-digit zero-padded paragraph index off, e.g.
+        # "ccpr-c-gc-35-0033" → "¶33".
+        m = re.search(r"-(\d+)$", record["paraId"])
+        if m:
+            paraN = f" ¶{int(m.group(1))}"
+    msg = (record.get("message") or "").strip()
+    msg_first = (msg.split("\n", 1)[0])[:60] if msg else "(no comment)"
+    title = f"[{cat_slug}] {sig}{paraN} — {msg_first}".strip()
+    if len(title) > 250:
+        title = title[:247] + "…"
+
+    body_md_lines = []
+    if msg:
+        body_md_lines.append(msg)
+        body_md_lines.append("")
+    body_md_lines.append("<details><summary>Submission context</summary>")
+    body_md_lines.append("")
+    body_md_lines.append(f"- **Category:** {cat_label} (`{record['kind']}`)")
+    body_md_lines.append(f"- **Document:** `{record.get('signature') or record.get('docId') or '—'}`")
+    body_md_lines.append(f"- **Paragraph ID:** `{record.get('paraId') or '—'}`")
+    body_md_lines.append(f"- **View:** `{record.get('view') or '—'}`")
+    body_md_lines.append(f"- **Scope:** `{record.get('scope') or '—'}`")
+    if record.get("query"):
+        body_md_lines.append(f"- **Search query at submission:** `{record['query']}`")
+    if record.get("url"):
+        body_md_lines.append(f"- **URL:** {record['url']}")
+    if record.get("excerpt"):
+        body_md_lines.append("")
+        body_md_lines.append("> " + record["excerpt"].replace("\n", " ")[:400])
+    if record.get("contact"):
+        body_md_lines.append("")
+        body_md_lines.append(f"_Reply-to:_ {record['contact']}")
+    body_md_lines.append("")
+    body_md_lines.append(f"_Submitted at {record['ts']} UTC_")
+    body_md_lines.append("</details>")
+
+    payload = {
+        "title": title,
+        "body":  "\n".join(body_md_lines),
+        "labels": ["feedback", "auto-filed", cat_slug],
+    }
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_REPO}/issues",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept":        "application/vnd.github+json",
+                "User-Agent":    "unhrdb-feedback-bot/1.0",
+                "Content-Type":  "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("number"), data.get("html_url")
+    except Exception as exc:
+        # Log to stderr so VM operator can see it, but don't fail the call.
+        sys.stderr.write(f"[feedback] github file failed: {exc}\n")
+        return None, None
 
 
 # Optional dev-mode entry point — production runs uvicorn directly via Docker.

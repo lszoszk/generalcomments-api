@@ -130,13 +130,39 @@ def test_browse_by_scope(client):
 def test_feedback_writes(client, tmp_path, monkeypatch):
     r = client.post(
         "/api/feedback",
-        json={"kind": "bug", "message": "Cite button missing on mobile"},
+        json={"kind": "wrong-text", "message": "Cite button missing on mobile"},
     )
     assert r.status_code == 200
-    assert r.json()["ok"] is True
+    body = r.json()
+    assert body["ok"] is True
+    # v19.14: response carries github issueNumber+issueUrl when the env
+    # token is configured. In tests no token → both are None.
+    assert "issueNumber" in body
+    assert "issueUrl" in body
+
+
+def test_feedback_accepts_paragraph_only(client):
+    # v19.14: comment is optional; a paragraph-scoped report with just a
+    # category is enough signal for the curator to investigate.
+    r = client.post(
+        "/api/feedback",
+        json={
+            "kind": "wrong-fn",
+            "paraId": "ccpr-c-gc-35-0033",
+            "docId":  "ccpr-c-gc-35",
+            "signature": "CCPR/C/GC/35",
+        },
+    )
+    assert r.status_code == 200
 
 
 def test_feedback_validates(client):
-    # message too short
-    r = client.post("/api/feedback", json={"kind": "bug", "message": "no"})
+    # message too long is rejected
+    r = client.post("/api/feedback", json={"kind": "other", "message": "x" * 2001})
     assert r.status_code == 422
+
+
+def test_feedback_unknown_category_buckets_other(client):
+    # Categories outside the v19.14 set fall back to "other" silently.
+    r = client.post("/api/feedback", json={"kind": "made-up-cat"})
+    assert r.status_code == 200
