@@ -45,7 +45,9 @@ def test_search_keyword(client):
 def test_search_boolean(client):
     r = client.get("/api/search?q=reasonable AND accommodation NOT (Spain)")
     body = r.json()
-    assert body["ftsExpr"].startswith('"reasonable"')
+    # v19.17 (recommendation B): bare words emit `"word"*` so plurals
+    # / inflections stem on both sides of NOT. Assertion adapted.
+    assert body["ftsExpr"].startswith('"reasonable"*')
     assert "( " in body["ftsExpr"]                 # paren group preserved
     # The Spain paragraph should be excluded.
     ids = [h["para_id"] for h in body["hits"]]
