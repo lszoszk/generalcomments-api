@@ -92,6 +92,34 @@ def test_search_body_union_only_one_kind(client):
     assert r.json()["total"] == 0
 
 
+def test_search_labels_any_vs_all(client):
+    """labels_mode controls multi-label combination.
+
+    ANY (default): paragraph carries at least one of the values.
+    ALL:           paragraph carries every value.
+    Total breakdown must satisfy gc + jur + sp == total in both modes,
+    and ALL ⊆ ANY so its total is never larger.
+    """
+    pair = "Women/girls,Children"
+    any_body = client.get(f"/api/search?labels={pair}").json()
+    all_body = client.get(f"/api/search?labels={pair}&labels_mode=all").json()
+
+    for body in (any_body, all_body):
+        bd = body["breakdown"]
+        assert bd["gc"] + bd["jur"] + bd["sp"] == body["total"]
+
+    assert all_body["total"] <= any_body["total"]
+    # If we only have one label, mode must not matter.
+    one_any = client.get("/api/search?labels=Women/girls").json()
+    one_all = client.get("/api/search?labels=Women/girls&labels_mode=all").json()
+    assert one_any["total"] == one_all["total"]
+
+
+def test_search_labels_mode_validates(client):
+    r = client.get("/api/search?labels=Women/girls&labels_mode=both")
+    assert r.status_code == 422
+
+
 def test_search_synonyms_when_no_hits(client):
     r = client.get("/api/search?q=AI+bias")
     body = r.json()

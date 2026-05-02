@@ -339,6 +339,15 @@ def search(
     countries: Optional[str] = None,
     outcomes: Optional[str] = None,
     labels: Optional[str] = None,
+    labels_mode: str = Query(
+        "any",
+        pattern="^(any|all)$",
+        description=(
+            "How to combine the values in `labels`. 'any' (default) returns "
+            "paragraphs tagged with at least one of them; 'all' returns "
+            "paragraphs tagged with every one."
+        ),
+    ),
     year_from: Optional[int] = Query(None, ge=1900, le=2100),
     year_to: Optional[int] = Query(None, ge=1900, le=2100),
     sort: str = Query("relevance", pattern="^(relevance|date_desc|date_asc)$"),
@@ -406,17 +415,29 @@ def search(
     if year_to is not None:
         where.append("d.year <= ?"); params.append(year_to)
     if label_list:
-        # Use a correlated EXISTS subquery rather than a JOIN so that
+        # Use correlated EXISTS subqueries rather than a JOIN so that
         # paragraphs tagged with multiple matching labels are never
-        # counted (or returned) more than once.  The old JOIN approach
+        # counted (or returned) more than once. The old JOIN approach
         # produced N rows per paragraph when N labels matched, causing
         # COUNT(*) and the per-type breakdown to be overcounted.
-        ph = ",".join("?" for _ in label_list)
-        where.append(
-            f"EXISTS (SELECT 1 FROM paragraph_label pl"
-            f" WHERE pl.rowid = p.rowid AND pl.value IN ({ph}))"
-        )
-        params.extend(label_list)
+        if labels_mode == "all":
+            # Paragraph must carry EVERY selected label — one EXISTS
+            # per value, AND-ed together.
+            for value in label_list:
+                where.append(
+                    "EXISTS (SELECT 1 FROM paragraph_label pl"
+                    " WHERE pl.rowid = p.rowid AND pl.value = ?)"
+                )
+                params.append(value)
+        else:
+            # ANY mode (default): a single EXISTS with IN(...) — paragraph
+            # carries at least one of the selected labels.
+            ph = ",".join("?" for _ in label_list)
+            where.append(
+                f"EXISTS (SELECT 1 FROM paragraph_label pl"
+                f" WHERE pl.rowid = p.rowid AND pl.value IN ({ph}))"
+            )
+            params.extend(label_list)
 
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     join_sql = " " + " ".join(joins)
