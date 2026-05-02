@@ -406,8 +406,17 @@ def search(
     if year_to is not None:
         where.append("d.year <= ?"); params.append(year_to)
     if label_list:
-        joins.append("JOIN paragraph_label pl ON pl.rowid = p.rowid")
-        in_clause("pl.value", label_list)
+        # Use a correlated EXISTS subquery rather than a JOIN so that
+        # paragraphs tagged with multiple matching labels are never
+        # counted (or returned) more than once.  The old JOIN approach
+        # produced N rows per paragraph when N labels matched, causing
+        # COUNT(*) and the per-type breakdown to be overcounted.
+        ph = ",".join("?" for _ in label_list)
+        where.append(
+            f"EXISTS (SELECT 1 FROM paragraph_label pl"
+            f" WHERE pl.rowid = p.rowid AND pl.value IN ({ph}))"
+        )
+        params.extend(label_list)
 
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     join_sql = " " + " ".join(joins)
