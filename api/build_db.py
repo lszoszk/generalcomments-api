@@ -212,6 +212,14 @@ def insert_document(cur, d: dict):
 
 def insert_paragraph(cur, p: dict, doc: dict):
     """Insert one paragraph + its labels. Returns rowid."""
+    # Some shards carry `section` as a string (per-paragraph heading) and
+    # some carry it as a list of heading levels (CESCR jurisprudence). Coerce
+    # to a single " > "-joined string for SQLite binding compatibility.
+    section_val = p.get("section")
+    if isinstance(section_val, list):
+        section_val = " > ".join(str(x) for x in section_val if x)
+    elif section_val is not None and not isinstance(section_val, str):
+        section_val = str(section_val)
     cur.execute(
         """INSERT INTO paragraphs (
             para_id, doc_id, idx, n, section, text, title, treaty_committee
@@ -221,7 +229,7 @@ def insert_paragraph(cur, p: dict, doc: dict):
             p.get("docId"),
             p.get("idx"),
             None if p.get("n") is None else str(p.get("n")),
-            p.get("section"),
+            section_val,
             p.get("text") or "",
             doc.get("nameShort") or doc.get("name") or doc.get("docId"),
             sniff_doc_committee_string(doc),
