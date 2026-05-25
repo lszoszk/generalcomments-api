@@ -16,6 +16,14 @@ past ~30 k ¶.
 > `echr-api` (8000), `uhri-dataset-api` (8001).
 > This service runs on `127.0.0.1:8002` and lives at `/unhrdb-api/`.
 
+## Use it from an AI client (MCP)
+
+[**mcp-unhrdb**](https://github.com/lszoszk/mcp-unhrdb) is a Model Context
+Protocol server that wraps this API, so Claude Desktop / Code / Cowork can
+search the corpus and resolve citations natively — returning verbatim,
+citable UN paragraphs. It re-exposes this backend over MCP via a token-gated,
+independently rate-limited route (`/unhrdb-mcp/`); no second index.
+
 ## Repo layout
 
 ```
