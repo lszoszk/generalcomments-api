@@ -122,10 +122,32 @@ app = FastAPI(
     "jurisprudence and Special Procedures reports.",
 )
 
-# Sprint 2: rate limit. Keys on remote IP (nginx forwards X-Forwarded-For,
-# slowapi reads it via get_remote_address). Tight on /api/feedback (write
-# path), looser on the read endpoints.
-limiter = Limiter(key_func=get_remote_address)
+# Sprint 2: rate limit, keyed on the real client IP. The app ALWAYS runs
+# behind the trusted local nginx (bound to 127.0.0.1:8002, never exposed
+# directly), so request.client.host is always 127.0.0.1 -- using slowapi's
+# get_remote_address would collapse every client into one global bucket.
+#
+# We key on X-Real-IP, which nginx sets from $remote_addr (the real TCP
+# peer) and OVERWRITES on every request, so a client cannot spoof it. We
+# deliberately do NOT trust the left-most X-Forwarded-For entry: nginx uses
+# $proxy_add_x_forwarded_for, which APPENDS the real IP to any client-sent
+# value, leaving the left-most token attacker-controlled (it could be
+# rotated to evade the limit). The right-most XFF entry is the one nginx
+# itself appended, so we fall back to that, then to get_remote_address.
+#
+# This trust model is valid ONLY because nginx is the sole front door; if
+# the app is ever exposed directly, these headers become spoofable again.
+def client_ip(request: Request) -> str:
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[-1].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_ip)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -351,6 +373,14 @@ def search(
     year_from: Optional[int] = Query(None, ge=1900, le=2100),
     year_to: Optional[int] = Query(None, ge=1900, le=2100),
     sort: str = Query("relevance", pattern="^(relevance|date_desc|date_asc)$"),
+    footnotes: bool = Query(
+        False,
+        description=(
+            "Include footnote text in the match. Default false (body only). "
+            "When false the FTS MATCH is column-filtered to the body columns "
+            "(title/treaty_committee/text) so footnote-only hits are excluded."
+        ),
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
 ):
@@ -380,7 +410,14 @@ def search(
     if fts_expr:
         joins.append("JOIN paragraphs_fts ON paragraphs_fts.rowid = p.rowid")
         where.append("paragraphs_fts MATCH ?")
-        params.append(fts_expr)
+        # Footnote search is opt-in (default off). When disabled, restrict the
+        # match to the body columns so footnote-only hits (e.g. case citations
+        # held in footnotes_text) are excluded. bm25 column weights are
+        # unaffected — footnotes_text simply never matches.
+        params.append(
+            fts_expr if footnotes
+            else f"{{title treaty_committee text}} : ({fts_expr})"
+        )
 
     if scope != "all":
         where.append("d.type = ?")
@@ -639,7 +676,7 @@ def post_feedback(request: Request, body: FeedbackBody = Body(...)):
     cat_label, cat_slug = FEEDBACK_CATEGORIES[cat_key]
     record = {
         "ts":        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "ip":        get_remote_address(request),
+        "ip":        client_ip(request),
         "agent":     request.headers.get("user-agent", "")[:200],
         "kind":      cat_key,
         "paraId":    body.paraId,
