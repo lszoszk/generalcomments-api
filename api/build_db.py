@@ -81,15 +81,19 @@ CREATE TABLE IF NOT EXISTS paragraphs (
     text               TEXT NOT NULL,
     -- Denormalised columns powering FTS5 BM25F:
     title              TEXT,                     -- copy of documents.name_short
-    treaty_committee   TEXT                      -- "CRPD · GC6" / "CEDAW · 103/2022"
+    treaty_committee   TEXT,                     -- "CRPD · GC6" / "CEDAW · 103/2022"
+    footnotes_text     TEXT                      -- concatenated footnote bodies (FTS only; never returned)
 );
 
--- FTS5 virtual table — three columns ranked by built-in BM25 with
--- column weights set at query time via bm25(title=8, treaty=4, text=1).
+-- FTS5 virtual table — four columns ranked by built-in BM25 with
+-- column weights set at query time via bm25(title=8, treaty=4, text=1,
+-- footnotes=0.3). footnotes_text is a low-weight column so footnote-only
+-- hits surface but always rank beneath body matches.
 CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts USING fts5(
     title,
     treaty_committee,
     text,
+    footnotes_text,
     content       = 'paragraphs',
     content_rowid = 'rowid',
     tokenize      = 'porter unicode61'
@@ -100,18 +104,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts USING fts5(
 -- isn't strictly needed; the after-insert/delete pair is what matters
 -- when we later move to incremental updates.)
 CREATE TRIGGER IF NOT EXISTS paragraphs_ai AFTER INSERT ON paragraphs BEGIN
-  INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text)
-       VALUES (new.rowid, new.title, new.treaty_committee, new.text);
+  INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text, footnotes_text)
+       VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
 END;
 CREATE TRIGGER IF NOT EXISTS paragraphs_ad AFTER DELETE ON paragraphs BEGIN
-  INSERT INTO paragraphs_fts(paragraphs_fts, rowid, title, treaty_committee, text)
-       VALUES ('delete', old.rowid, old.title, old.treaty_committee, old.text);
+  INSERT INTO paragraphs_fts(paragraphs_fts, rowid, title, treaty_committee, text, footnotes_text)
+       VALUES ('delete', old.rowid, old.title, old.treaty_committee, old.text, old.footnotes_text);
 END;
 CREATE TRIGGER IF NOT EXISTS paragraphs_au AFTER UPDATE ON paragraphs BEGIN
-  INSERT INTO paragraphs_fts(paragraphs_fts, rowid, title, treaty_committee, text)
-       VALUES ('delete', old.rowid, old.title, old.treaty_committee, old.text);
-  INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text)
-       VALUES (new.rowid, new.title, new.treaty_committee, new.text);
+  INSERT INTO paragraphs_fts(paragraphs_fts, rowid, title, treaty_committee, text, footnotes_text)
+       VALUES ('delete', old.rowid, old.title, old.treaty_committee, old.text, old.footnotes_text);
+  INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text, footnotes_text)
+       VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
 END;
 
 -- Many-to-many lookups for filter chips.
@@ -210,6 +214,30 @@ def insert_document(cur, d: dict):
         )
 
 
+def flatten_footnotes(p: dict) -> str:
+    """Concatenate a paragraph's footnote bodies into one searchable string.
+
+    Footnotes arrive as a list of {text: …} objects (corpus.json / shards),
+    occasionally as bare strings. We join with a newline so two adjacent
+    footnotes don't produce a spurious cross-footnote phrase match. The
+    result feeds the FTS-only `footnotes_text` column; it is never returned
+    as paragraph text, so the displayed paragraph stays verbatim body."""
+    fns = p.get("footnotes")
+    if not fns:
+        return ""
+    if isinstance(fns, str):
+        return fns
+    parts = []
+    for f in fns:
+        if isinstance(f, dict):
+            t = f.get("text") or f.get("body") or f.get("content") or ""
+        else:
+            t = str(f)
+        if t:
+            parts.append(t)
+    return " \n ".join(parts)
+
+
 def insert_paragraph(cur, p: dict, doc: dict):
     """Insert one paragraph + its labels. Returns rowid."""
     # Some shards carry `section` as a string (per-paragraph heading) and
@@ -222,8 +250,8 @@ def insert_paragraph(cur, p: dict, doc: dict):
         section_val = str(section_val)
     cur.execute(
         """INSERT INTO paragraphs (
-            para_id, doc_id, idx, n, section, text, title, treaty_committee
-        ) VALUES (?,?,?,?,?,?,?,?)""",
+            para_id, doc_id, idx, n, section, text, title, treaty_committee, footnotes_text
+        ) VALUES (?,?,?,?,?,?,?,?,?)""",
         (
             p.get("id") or p.get("paragraphId"),
             p.get("docId"),
@@ -233,6 +261,7 @@ def insert_paragraph(cur, p: dict, doc: dict):
             p.get("text") or "",
             doc.get("nameShort") or doc.get("name") or doc.get("docId"),
             sniff_doc_committee_string(doc),
+            flatten_footnotes(p),
         ),
     )
     rowid = cur.lastrowid
@@ -278,9 +307,15 @@ def build(src: Path, out_db: Path) -> dict:
             docs_by_id[d["docId"]] = d
             insert_document(cur, d)
 
-    # 3) GC + SP paragraphs (corpus.json — single big array)
+    # 3) GC + SP paragraphs. v19.60: SP paragraphs were split out of
+    #    corpus.json (now GC-only) into sp-corpus.json so the static
+    #    frontend's boot-time index stays small; the API indexes both.
     print("[build] reading corpus.json …")
     gc_sp_paragraphs = read_json(src / "corpus.json")
+    sp_corpus_path = src / "sp-corpus.json"
+    if sp_corpus_path.exists():
+        print("[build] reading sp-corpus.json …")
+        gc_sp_paragraphs = gc_sp_paragraphs + read_json(sp_corpus_path)
     inserted_paragraphs = 0
     for p in gc_sp_paragraphs:
         doc = docs_by_id.get(p.get("docId"))
@@ -332,7 +367,7 @@ def write_manifest(out_dir: Path, counts: dict, db_path: Path, *, pretty: bool):
         "builtAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "schema": "1.0",
         "tokenizer": "porter unicode61",
-        "fts_columns": ["title", "treaty_committee", "text"],
+        "fts_columns": ["title", "treaty_committee", "text", "footnotes_text"],
         "counts": counts,
         "files": {
             "unhrdb.sqlite3": {

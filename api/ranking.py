@@ -114,9 +114,11 @@ def parse_csv(value: str | None) -> list[str]:
 
 def column_weights() -> str:
     """BM25F column weights for paragraphs_fts.
-    title = 8, treaty_committee = 4, text = 1 — the heavier the column,
-    the more a hit there pushes the row up the ranking. ECHR uses 10/4/1;
-    we tone the title weight down because our titles are shorter
-    ("GC6: equality and non-discrimination") so they would otherwise win
-    every match in their own document."""
-    return "8.0, 4.0, 1.0"
+    title = 8, treaty_committee = 4, text = 1, footnotes_text = 0.3 — the
+    heavier the column, the more a hit there pushes the row up the ranking.
+    ECHR uses 10/4/1; we tone the title weight down because our titles are
+    shorter ("GC6: equality and non-discrimination") so they would
+    otherwise win every match in their own document. footnotes_text carries
+    a low weight so footnote-only hits (e.g. case citations) surface but
+    always rank beneath body matches."""
+    return "8.0, 4.0, 1.0, 0.3"
