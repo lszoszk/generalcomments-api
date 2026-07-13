@@ -45,13 +45,28 @@ def test_search_keyword(client):
 def test_search_boolean(client):
     r = client.get("/api/search?q=reasonable AND accommodation NOT (Spain)")
     body = r.json()
-    # v19.17 (recommendation B): bare words emit `"word"*` so plurals
-    # / inflections stem on both sides of NOT. Assertion adapted.
-    assert body["ftsExpr"].startswith('"reasonable"*')
+    assert body["ftsExpr"].startswith('"reasonable"')
     assert "( " in body["ftsExpr"]                 # paren group preserved
     # The Spain paragraph should be excluded.
     ids = [h["para_id"] for h in body["hits"]]
     assert "crpd-c-34-d-103-2022-0001" not in ids
+
+
+def test_search_does_not_stem_bare_words(client):
+    """Bare `reasoning` is exact; only explicit `reason*` expands it."""
+    strict = client.get(
+        "/api/search",
+        params={"q": '"hold opinions" AND reasoning'},
+    ).json()
+    assert strict["total"] == 1
+    assert [hit["para_id"] for hit in strict["hits"]] == ["a-76-380-0001"]
+    assert strict["ftsExpr"].endswith('"reasoning"')
+
+    expanded = client.get(
+        "/api/search",
+        params={"q": '"hold opinions" AND reason*'},
+    ).json()
+    assert expanded["total"] == 2
 
 
 def test_search_scope_filter(client):

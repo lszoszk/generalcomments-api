@@ -96,7 +96,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts USING fts5(
     footnotes_text,
     content       = 'paragraphs',
     content_rowid = 'rowid',
-    tokenize      = 'porter unicode61'
+    tokenize      = 'unicode61'
 );
 
 -- Trigger pair: keep paragraphs_fts in sync with the underlying table.
@@ -312,8 +312,18 @@ def build(src: Path, out_db: Path) -> dict:
     #    frontend's boot-time index stays small; the API indexes both.
     print("[build] reading corpus.json …")
     gc_sp_paragraphs = read_json(src / "corpus.json")
+    # v19.64: SP paragraphs were split from the monolithic sp-corpus.json
+    # into per-committee shards (docs/sp/shards/sp_<Committee>.json) to stay
+    # under GitHub's 100 MB file limit. Read the shards when present; fall
+    # back to the pre-split monolith otherwise.
+    sp_shards_dir = src / "sp" / "shards"
     sp_corpus_path = src / "sp-corpus.json"
-    if sp_corpus_path.exists():
+    if sp_shards_dir.exists():
+        sp_shard_paths = sorted(sp_shards_dir.glob("*.json"))
+        print(f"[build] reading {len(sp_shard_paths)} SP shards …")
+        for shard_path in sp_shard_paths:
+            gc_sp_paragraphs = gc_sp_paragraphs + read_json(shard_path)
+    elif sp_corpus_path.exists():
         print("[build] reading sp-corpus.json …")
         gc_sp_paragraphs = gc_sp_paragraphs + read_json(sp_corpus_path)
     inserted_paragraphs = 0
@@ -366,7 +376,7 @@ def write_manifest(out_dir: Path, counts: dict, db_path: Path, *, pretty: bool):
         "version": datetime.now(timezone.utc).strftime("%Y%m%d"),
         "builtAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "schema": "1.0",
-        "tokenizer": "porter unicode61",
+        "tokenizer": "unicode61",
         "fts_columns": ["title", "treaty_committee", "text", "footnotes_text"],
         "counts": counts,
         "files": {

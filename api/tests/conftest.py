@@ -46,15 +46,16 @@ CREATE TABLE documents (
 CREATE TABLE paragraphs (
     rowid INTEGER PRIMARY KEY, para_id TEXT NOT NULL UNIQUE,
     doc_id TEXT NOT NULL, idx INTEGER, n TEXT, section TEXT,
-    text TEXT NOT NULL, title TEXT, treaty_committee TEXT
+    text TEXT NOT NULL, title TEXT, treaty_committee TEXT,
+    footnotes_text TEXT
 );
 CREATE VIRTUAL TABLE paragraphs_fts USING fts5(
-    title, treaty_committee, text,
-    content='paragraphs', content_rowid='rowid', tokenize='porter unicode61'
+    title, treaty_committee, text, footnotes_text,
+    content='paragraphs', content_rowid='rowid', tokenize='unicode61'
 );
 CREATE TRIGGER paragraphs_ai AFTER INSERT ON paragraphs BEGIN
-    INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text)
-        VALUES (new.rowid, new.title, new.treaty_committee, new.text);
+    INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text, footnotes_text)
+        VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
 END;
 CREATE TABLE paragraph_label (rowid INTEGER, value TEXT);
 CREATE TABLE document_committee (doc_id TEXT, value TEXT);
@@ -76,7 +77,7 @@ DOCS = [
 ]
 PARAS = [
     ("crpd-c-gc-6-0001", "crpd-c-gc-6", 1, "1", None,
-     "Reasonable accommodation is required to secure equality."),
+     "Reasonable accommodation is required to secure equality. The right to hold opinions is protected. For these reasons, safeguards matter."),
     ("crpd-c-gc-6-0002", "crpd-c-gc-6", 2, "2", None,
      "Discrimination on grounds of disability includes denial of reasonable accommodation."),
     ("crpd-c-34-d-103-2022-0001", "crpd-c-34-d-103-2022", 1, "1", None,
@@ -84,7 +85,7 @@ PARAS = [
     ("crpd-c-34-d-103-2022-0002", "crpd-c-34-d-103-2022", 2, "2", None,
      "The Committee finds a violation of article 12 of the Convention."),
     ("a-76-380-0001", "a-76-380", 1, "1", None,
-     "The right to freedom of thought has long been overlooked in algorithmic discrimination contexts."),
+     "The right to freedom of thought has long been overlooked in algorithmic discrimination contexts. The right to hold opinions includes forming them by way of reasoning."),
 ]
 
 
@@ -100,10 +101,10 @@ def fixture_db():
     for para_id, doc_id, idx, n, section, text in PARAS:
         doc = next(x for x in DOCS if x["doc_id"] == doc_id)
         cur.execute(
-            "INSERT INTO paragraphs (para_id, doc_id, idx, n, section, text, title, treaty_committee) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO paragraphs (para_id, doc_id, idx, n, section, text, title, treaty_committee, footnotes_text) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (para_id, doc_id, idx, n, section, text,
-             doc["name_short"], f"{doc.get('treaty') or doc.get('mandate')} · {doc['signature']}"),
+             doc["name_short"], f"{doc.get('treaty') or doc.get('mandate')} · {doc['signature']}", ""),
         )
     conn.commit()
     conn.close()

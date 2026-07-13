@@ -14,10 +14,9 @@ parse_csv(value: str | None) -> list[str]
     Split a comma-separated query parameter, trimming + de-duping.
 
 Note on tokenisation:
-The DB uses `tokenize=porter unicode61`, so `discriminat*` (prefix
+The DB uses `tokenize=unicode61`, so `discriminat*` (explicit prefix
 wildcard), `"reasonable accommodation"` (phrase), and `women OR girls`
-(OR) all work natively. We forward those constructs untouched and
-escape everything else.
+(OR) all work natively without automatic stemming.
 """
 from __future__ import annotations
 
@@ -66,15 +65,10 @@ def _sanitise_token(tok: str) -> str:
         body = tok[:-1]
         body = _DANGEROUS_CHARS.sub("", body)
         return f"{body}*" if body else ""
-    # Bare word: scrub then quote-and-prefix so FTS5 stems the term.
-    # v19.17 (recommendation B): bare words emit `"word"*` so a query
-    # like `women NOT girl` stems both sides (matches women/womens AND
-    # excludes girl/girls/girlfriend). Without the trailing `*` the
-    # NOT side missed plurals — a real UX gap for boolean searches.
-    # Users who want strict literal match can still quote the term:
-    # `"AI"` stays literal; `AI` stems to AI/AID/AIM.
+    # Bare words remain exact tokens. Prefix expansion is reserved for an
+    # explicit trailing `*`, matching the UI syntax guide.
     safe = _DANGEROUS_CHARS.sub("", tok)
-    return f'"{safe}"*' if safe else ""
+    return f'"{safe}"' if safe else ""
 
 
 def build_fts_query(raw: str | None) -> str | None:
@@ -83,11 +77,11 @@ def build_fts_query(raw: str | None) -> str | None:
     Examples
     --------
     >>> build_fts_query('reasonable accommodation')
-    '"reasonable"* "accommodation"*'
+    '"reasonable" "accommodation"'
     >>> build_fts_query('"AI bias"')
     '"AI bias"'
     >>> build_fts_query('trafficking AND children NOT (sexual)')
-    '"trafficking"* AND "children"* NOT ( "sexual"* )'
+    '"trafficking" AND "children" NOT ( "sexual" )'
     >>> build_fts_query('discriminat*')
     'discriminat*'
     """
