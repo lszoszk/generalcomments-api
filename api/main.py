@@ -401,7 +401,7 @@ def search(
     select_cols = (
         "p.rowid, p.para_id, p.doc_id, p.idx, p.n, p.section, p.text, "
         "d.type, d.treaty, d.committee, d.mandate, d.country, d.year, d.communication_year, "
-        "d.adoption_date, d.signature, d.outcome, d.name, d.name_short"
+        "d.adoption_date, d.signature, d.outcome, d.name, d.name_short, d.link"
     )
     joins = ["JOIN documents d ON d.doc_id = p.doc_id"]
     where: list[str] = []

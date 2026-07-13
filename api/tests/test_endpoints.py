@@ -40,6 +40,7 @@ def test_search_keyword(client):
     assert all("<mark>" in (h["snippet"] or "") for h in body["hits"])
     assert body["breakdown"]["gc"] >= 1
     assert body["breakdown"]["jur"] >= 1
+    assert all("link" in h for h in body["hits"])
 
 
 def test_search_boolean(client):
