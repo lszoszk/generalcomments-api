@@ -28,6 +28,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -54,7 +55,8 @@ CREATE TABLE IF NOT EXISTS documents (
     name_short      TEXT,                 -- catalogue-row title
     signature       TEXT,                 -- UN doc symbol (CRPD/C/GC/6, A/76/380…)
     country         TEXT,                 -- JUR only — respondent state
-    year            INTEGER,
+    year            INTEGER,              -- adoption/decision year for JUR
+    communication_year INTEGER,            -- JUR communication number year
     adoption_date   TEXT,                 -- "21 Nov 1997" or YYYY where unknown
     outcome         TEXT,                 -- JUR only (violation, inadmissible…)
     link            TEXT,                 -- canonical un.org / ohchr.org URL
@@ -170,14 +172,48 @@ def sniff_doc_committee_string(d: dict) -> str:
     return f"{d.get('committee') or ''} · {d.get('signature', '')}"
 
 
+def year_from_date(value) -> int | None:
+    matches = re.findall(r"\b(?:19|20)\d{2}\b", str(value or ""))
+    return int(matches[-1]) if matches else None
+
+
+def plausible_decision_year(value) -> int | None:
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    return year if 1900 <= year <= datetime.now(timezone.utc).year else None
+
+
+def document_research_year(d: dict) -> int | None:
+    if d.get("type") == "jur":
+        return (
+            plausible_decision_year(year_from_date(d.get("jurisDecisionDate")))
+            or plausible_decision_year(d.get("adoptionYear"))
+            or plausible_decision_year(year_from_date(d.get("adoptionDate")))
+            or d.get("year")
+        )
+    return d.get("year") or d.get("adoptionYear")
+
+
+def document_adoption_date(d: dict) -> str | None:
+    if d.get("type") == "jur":
+        for value in (d.get("jurisDecisionDate"), d.get("adoptionDate")):
+            year = year_from_date(value)
+            if value and (year is None or plausible_decision_year(year)):
+                return value
+        return None
+    return d.get("adoptionDate")
+
+
 def insert_document(cur, d: dict):
     cur.execute(
         """INSERT OR REPLACE INTO documents (
             doc_id, type, treaty, committee, mandate, name, name_short, signature,
-            country, year, adoption_date, outcome, link, paragraph_count,
+            country, year, communication_year, adoption_date, outcome, link, paragraph_count,
             case_labels, abstract, status, superseded_by, report_type, presented,
             articles_cited, last_verified, word_count, label_count
-        ) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?)""",
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             d.get("docId"),
             d.get("type"),
@@ -188,8 +224,9 @@ def insert_document(cur, d: dict):
             d.get("nameShort"),
             d.get("signature") or d.get("symbol"),
             d.get("country"),
-            d.get("year"),
-            d.get("adoptionDate"),
+            document_research_year(d),
+            (d.get("communicationYear") or d.get("year")) if d.get("type") == "jur" else None,
+            document_adoption_date(d),
             d.get("outcome"),
             d.get("link"),
             d.get("paragraphCount"),
@@ -307,34 +344,47 @@ def build(src: Path, out_db: Path) -> dict:
             docs_by_id[d["docId"]] = d
             insert_document(cur, d)
 
-    # 3) GC + SP paragraphs. v19.60: SP paragraphs were split out of
-    #    corpus.json (now GC-only) into sp-corpus.json so the static
-    #    frontend's boot-time index stays small; the API indexes both.
+    # 3) GC + SP paragraphs. corpus.json is GC-only. SP used to live in
+    #    sp-corpus.json, but is now split across 46 mandate shards.
     print("[build] reading corpus.json …")
-    gc_sp_paragraphs = read_json(src / "corpus.json")
-    # v19.64: SP paragraphs were split from the monolithic sp-corpus.json
-    # into per-committee shards (docs/sp/shards/sp_<Committee>.json) to stay
-    # under GitHub's 100 MB file limit. Read the shards when present; fall
-    # back to the pre-split monolith otherwise.
-    sp_shards_dir = src / "sp" / "shards"
-    sp_corpus_path = src / "sp-corpus.json"
-    if sp_shards_dir.exists():
-        sp_shard_paths = sorted(sp_shards_dir.glob("*.json"))
-        print(f"[build] reading {len(sp_shard_paths)} SP shards …")
-        for shard_path in sp_shard_paths:
-            gc_sp_paragraphs = gc_sp_paragraphs + read_json(shard_path)
-    elif sp_corpus_path.exists():
-        print("[build] reading sp-corpus.json …")
-        gc_sp_paragraphs = gc_sp_paragraphs + read_json(sp_corpus_path)
     inserted_paragraphs = 0
-    for p in gc_sp_paragraphs:
+    inserted_sp_paragraphs = 0
+    for p in read_json(src / "corpus.json"):
         doc = docs_by_id.get(p.get("docId"))
         if not doc:
             continue
         insert_paragraph(cur, p, doc)
         inserted_paragraphs += 1
+        if doc.get("type") == "sp":
+            inserted_sp_paragraphs += 1
         if inserted_paragraphs % 5000 == 0:
             print(f"  …inserted {inserted_paragraphs} paragraphs")
+
+    # Backward-compatible flat file first; current builds use mandate shards.
+    if inserted_sp_paragraphs == 0:
+        sp_corpus_path = src / "sp-corpus.json"
+        sp_shards_dir = src / "sp" / "shards"
+        if sp_corpus_path.exists():
+            sp_sources = [sp_corpus_path]
+            print("[build] reading sp-corpus.json …")
+        elif sp_shards_dir.exists():
+            sp_sources = sorted(sp_shards_dir.glob("*.json"))
+            print(f"[build] reading {len(sp_sources)} Special Procedures shards …")
+        else:
+            sp_sources = []
+
+        for source_path in sp_sources:
+            payload = read_json(source_path)
+            paragraphs = payload if isinstance(payload, list) else payload.get("paragraphs", [])
+            for p in paragraphs:
+                doc = docs_by_id.get(p.get("docId"))
+                if not doc:
+                    continue
+                insert_paragraph(cur, p, doc)
+                inserted_paragraphs += 1
+                inserted_sp_paragraphs += 1
+            if len(sp_sources) > 1:
+                print(f"  {source_path.name}: {inserted_sp_paragraphs} SP paragraphs total")
 
     # 4) JUR paragraphs (one shard at a time so memory stays flat)
     jur_shards_dir = src / "jur" / "shards"
@@ -356,6 +406,17 @@ def build(src: Path, out_db: Path) -> dict:
 
     conn.commit()
 
+    expected_sp = sum(
+        int(d.get("paragraphCount") or 0)
+        for d in docs_by_id.values()
+        if d.get("type") == "sp"
+    )
+    if expected_sp and inserted_sp_paragraphs != expected_sp:
+        raise RuntimeError(
+            "Special Procedures corpus incomplete: "
+            f"inserted {inserted_sp_paragraphs:,} of {expected_sp:,} expected paragraphs"
+        )
+
     # 5) Optimise. The FTS5 'optimize' command merges segments — slower
     # writes after this, but read latency drops by 30-50 % on big corpora.
     print("[build] optimising FTS5 index …")
@@ -375,7 +436,7 @@ def write_manifest(out_dir: Path, counts: dict, db_path: Path, *, pretty: bool):
     manifest = {
         "version": datetime.now(timezone.utc).strftime("%Y%m%d"),
         "builtAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "schema": "1.0",
+        "schema": "1.1",
         "tokenizer": "unicode61",
         "fts_columns": ["title", "treaty_committee", "text", "footnotes_text"],
         "counts": counts,

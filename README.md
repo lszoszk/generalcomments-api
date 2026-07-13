@@ -130,6 +130,10 @@ All read-only; CORS allows `https://lszoszk.github.io` and localhost.
 Gzip middleware enabled. Cache-Control headers can be added per
 endpoint in Sprint 2.
 
+For jurisprudence, `year` is the year in which the Committee adopted its
+Views or decision. The year embedded in the communication number is returned
+separately as `communication_year`; `adoption_date` retains the full date.
+
 ## Performance numbers (Sprint 1, Apple M-series local)
 
 | Scenario                                              | tookMs |

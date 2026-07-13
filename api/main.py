@@ -400,7 +400,7 @@ def search(
     # filter chips work whether or not `q` is set.
     select_cols = (
         "p.rowid, p.para_id, p.doc_id, p.idx, p.n, p.section, p.text, "
-        "d.type, d.treaty, d.committee, d.mandate, d.country, d.year, "
+        "d.type, d.treaty, d.committee, d.mandate, d.country, d.year, d.communication_year, "
         "d.adoption_date, d.signature, d.outcome, d.name, d.name_short"
     )
     joins = ["JOIN documents d ON d.doc_id = p.doc_id"]
@@ -591,7 +591,8 @@ def get_paragraph(para_id: str, response: Response):
     with db_cursor() as cur:
         cur.execute(
             "SELECT p.*, d.type, d.treaty, d.committee, d.mandate, d.country, "
-            "       d.year, d.signature, d.name, d.name_short, d.outcome, d.link "
+            "       d.year, d.communication_year, d.adoption_date, d.signature, "
+            "       d.name, d.name_short, d.outcome, d.link "
             "FROM paragraphs p JOIN documents d ON d.doc_id = p.doc_id "
             "WHERE p.para_id = ?",
             (para_id,),

@@ -85,6 +85,18 @@ def test_search_year_filter(client):
     assert all(h["year"] == 2018 for h in body["hits"])
 
 
+def test_jurisprudence_year_is_decision_year(client):
+    adopted = client.get("/api/search?q=violation&scope=jur&year_from=2024&year_to=2024").json()
+    assert adopted["total"] == 1
+    assert adopted["hits"][0]["year"] == 2024
+    assert adopted["hits"][0]["communication_year"] == 2022
+
+    communication_number_year = client.get(
+        "/api/search?q=violation&scope=jur&year_from=2022&year_to=2022"
+    ).json()
+    assert communication_number_year["total"] == 0
+
+
 def test_search_body_union_filter(client):
     """body=CRPD should match BOTH the GC doc (committee=CRPD) and the
     JUR doc (treaty=CRPD) — the per-column slots OR'd together. This is

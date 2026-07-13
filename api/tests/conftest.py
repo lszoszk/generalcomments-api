@@ -38,7 +38,7 @@ SCHEMA = """
 CREATE TABLE documents (
     doc_id TEXT PRIMARY KEY, type TEXT NOT NULL, treaty TEXT, committee TEXT,
     mandate TEXT, name TEXT, name_short TEXT, signature TEXT, country TEXT,
-    year INTEGER, adoption_date TEXT, outcome TEXT, link TEXT,
+    year INTEGER, communication_year INTEGER, adoption_date TEXT, outcome TEXT, link TEXT,
     paragraph_count INTEGER, case_labels TEXT, abstract TEXT, status TEXT,
     superseded_by TEXT, report_type TEXT, presented TEXT, articles_cited TEXT,
     last_verified TEXT, word_count INTEGER, label_count INTEGER
@@ -70,7 +70,8 @@ DOCS = [
     dict(doc_id="crpd-c-34-d-103-2022", type="jur", treaty="CRPD", committee="CRPD",
          country="Spain", outcome="violation_found",
          name="Communication No. 103/2022", name_short="103/2022",
-         signature="CRPD/C/34/D/103/2022", year=2022, paragraph_count=2),
+         signature="CRPD/C/34/D/103/2022", year=2024, communication_year=2022,
+         adoption_date="29 August 2024", paragraph_count=2),
     dict(doc_id="a-76-380", type="sp", mandate="SR Freedom of Religion or Belief",
          name="The Freedom of Thought", name_short="Freedom of Thought",
          signature="A/76/380", year=2021, paragraph_count=1),
