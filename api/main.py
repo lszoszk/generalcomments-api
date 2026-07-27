@@ -31,9 +31,11 @@ evaluated eagerly side-steps the issue cleanly.
 
 import json
 import os
+import queue
 import re
 import sqlite3
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -166,10 +168,43 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# DB connection (per-request, autocommit, read-only).
+# DB connections: a small pool of long-lived, read-only handles.
 # ---------------------------------------------------------------------------
-@contextmanager
-def db_cursor():
+# Pooled, NOT per-request. Opening a connection is cheap; throwing one
+# away is not, because SQLite's page cache lives on the connection.
+# Closing after every request discarded the cached FTS index pages each
+# time, leaving the OS page cache as the only thing standing between a
+# query and the disk — and in a 512 MB cgroup holding a 518 MB database
+# that cache cannot retain the index, so effectively EVERY request ran
+# cold. Measured on the deployed VM: /api/search took 460-720 ms on every
+# call, warm or cold, with a reused TCP connection and ~15 ms of RTT.
+# The same code and query shapes against a local copy run 30-40 ms warm
+# and 170-470 ms cold — the deployed numbers are the cold figure, every
+# time.
+#
+# Each pooled connection is borrowed by exactly one request at a time.
+# Two things ruled out the simpler shapes:
+#  ─ One connection shared across threads is NOT safe here despite
+#    sqlite3.threadsafety == 3. Concurrent requests on one connection
+#    made cur.fetchone() return None mid-flight (search() then raised
+#    TypeError on c["total"]); 1 of 12 concurrent searches 500'd in
+#    testing. Serialized threading protects SQLite's own state, not the
+#    Python-level cursor/statement bookkeeping on a shared connection.
+#  ─ Thread-local connections are safe but unbounded: uvicorn's sync
+#    threadpool defaults to 40 threads, so any cache worth having is
+#    multiplied by 40 and blows a 512 MB container's budget on its own.
+#
+# A pool bounds both: POOL_SIZE caches, one borrower each. Total page
+# cache is POOL_SIZE * CACHE_MB (default 4 * 32 = 128 MiB), which must
+# stay well inside the container's mem_limit — see docker-compose.yml.
+POOL_SIZE = int(os.getenv("UNHRDB_SQLITE_POOL", "4"))
+CACHE_MB = int(os.getenv("UNHRDB_SQLITE_CACHE_MB", "32"))
+_pool: "queue.Queue[sqlite3.Connection]" = queue.Queue(maxsize=POOL_SIZE)
+_pool_made = 0
+_pool_lock = threading.Lock()
+
+
+def _new_conn() -> sqlite3.Connection:
     # Read-only via URI mode=ro AND immutable=1.
     # ─ mode=ro alone fails on a :ro bind mount because SQLite still
     #   tries to create -shm / -wal side files for WAL bookkeeping
@@ -178,16 +213,46 @@ def db_cursor():
     # ─ immutable=1 tells SQLite the file will never change during the
     #   connection's lifetime, so it skips all WAL/SHM management. This
     #   is exactly true for our deploy model (we rebuild the DB locally
-    #   and rsync it; the container is restarted).
+    #   and rsync it; the container is restarted). It is also what makes
+    #   holding connections open across requests safe: the file is
+    #   promised not to change underneath them.
     conn = sqlite3.connect(
         f"file:{DB_PATH}?mode=ro&immutable=1",
         uri=True, check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
+    # Negative cache_size is KiB rather than pages.
+    conn.execute(f"PRAGMA cache_size=-{CACHE_MB * 1024}")
+    return conn
+
+
+@contextmanager
+def db_cursor():
+    """Borrow a pooled connection for the duration of one request.
+
+    Connections are created lazily up to POOL_SIZE, then borrowers wait.
+    They are never closed: the whole point is that SQLite's page cache —
+    which lives on the connection — survives between requests. Closing it
+    each time, as this did before, left the OS page cache as the only
+    thing between a query and the disk, and in a 512 MB cgroup holding a
+    518 MB database that cache cannot retain the FTS index, so every
+    request effectively ran cold.
+    """
+    global _pool_made
+    conn = None
+    if _pool_made < POOL_SIZE:
+        with _pool_lock:
+            if _pool_made < POOL_SIZE:
+                conn = _new_conn()
+                _pool_made += 1
+    if conn is None:
+        conn = _pool.get()
+    cur = conn.cursor()
     try:
-        yield conn.cursor()
+        yield cur
     finally:
-        conn.close()
+        cur.close()
+        _pool.put(conn)
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
