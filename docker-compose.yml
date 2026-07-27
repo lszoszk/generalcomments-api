@@ -16,25 +16,8 @@ services:
       # file the container can mutate is the feedback log.
       - ./feedback:/feedback
     restart: unless-stopped
-    # 512m was BELOW the database it serves (unhrdb.sqlite3 is 518 MB), so
-    # the OS page cache could never retain the FTS index and every search
-    # ran cold. Measured against the deployed VM: /api/search took 460-720
-    # ms on every call regardless of repetition, over a reused TCP
-    # connection with ~15 ms RTT and only ~1 ms of download. The identical
-    # code and query shapes against a local copy of the DB run 30-40 ms
-    # warm and 170-470 ms cold — i.e. the deployed figures ARE the cold
-    # figures, on every single request.
-    #
-    # Budget at 1g: ~150 MB Python/uvicorn + 128 MB SQLite page cache
-    # (UNHRDB_SQLITE_POOL=4 x UNHRDB_SQLITE_CACHE_MB=32, see main.py)
-    # leaves ~700 MB of headroom for the OS to cache the hot parts of the
-    # file. Raise CACHE_MB before raising POOL_SIZE — more pool entries
-    # multiply the cache without improving latency for this workload.
-    #
-    # NOTE: the host runs several other API containers. Confirm free RAM
-    # before applying, and prefer raising this one over adding workers.
-    mem_limit: 1g
-    mem_reservation: 256m
+    mem_limit: 512m
+    mem_reservation: 128m
     environment:
       - UNHRDB_DB_PATH=/data/unhrdb.sqlite3
       - UNHRDB_FEEDBACK_DIR=/feedback
