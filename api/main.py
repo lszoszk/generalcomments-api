@@ -219,6 +219,56 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return {k: row[k] for k in row.keys()}
 
 
+# Hoisted out of search() so the schema probe below can test the EXACT
+# column list the endpoint depends on, rather than a hand-maintained copy
+# that would drift.
+SEARCH_SELECT_COLS = (
+    "p.rowid, p.para_id, p.doc_id, p.idx, p.n, p.section, p.text, "
+    "d.type, d.treaty, d.committee, d.mandate, d.country, d.year, d.communication_year, "
+    "d.adoption_date, d.signature, d.outcome, d.name, d.name_short, d.link"
+)
+
+_schema_error: Optional[str] = None
+_schema_checked = False
+
+
+def schema_error() -> Optional[str]:
+    """Describe any mismatch between this build and the DB it was given.
+
+    The API and the database are a matched pair: build_db.py adds columns
+    (communication_year, link, …) that the endpoints then select. Ship the
+    code without rsyncing a rebuilt DB and every /api/search and
+    /api/paragraph 500s on "no such column" — silently, one request at a
+    time, which is exactly how it went unnoticed on the VM: the deployed
+    DB was built 2026-07-13 and predates the columns this build selects.
+
+    Probing with LIMIT 0 costs nothing and is self-maintaining — it
+    exercises whatever SEARCH_SELECT_COLS currently names, so a column
+    added later is covered without touching this function. Result is
+    memoised: the DB is opened immutable and cannot change under us.
+    """
+    global _schema_error, _schema_checked
+    if _schema_checked:
+        return _schema_error
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                f"SELECT {SEARCH_SELECT_COLS} FROM paragraphs p "
+                "JOIN documents d ON d.doc_id = p.doc_id LIMIT 0"
+            )
+        _schema_error = None
+    except sqlite3.OperationalError as exc:
+        _schema_error = (
+            f"DB schema is older than this build of the API ({exc}). "
+            "Rebuild with build_db.py and rsync data/unhrdb.sqlite3 — code and "
+            "DB must be deployed together."
+        )
+    except Exception as exc:  # DB missing/unreadable — /health reports it anyway
+        _schema_error = f"schema probe failed: {exc}"
+    _schema_checked = True
+    return _schema_error
+
+
 def manifest_path() -> str:
     return os.path.join(os.path.dirname(DB_PATH), "manifest.json")
 
@@ -251,9 +301,17 @@ def health(response: Response):
         with db_cursor() as cur:
             cur.execute("SELECT count(*) AS n FROM paragraphs LIMIT 1")
             n = cur.fetchone()["n"]
-        return {"status": "ok", "version": APP_VERSION, "paragraphs": n}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"DB unavailable: {exc}")
+    # Counting paragraphs proves the file opens, not that it matches this
+    # build — a DB one rebuild behind passes that check and then 500s on
+    # every search. Fail the healthcheck instead, so a bad deploy shows up
+    # as an unhealthy container within 30s rather than as user-facing
+    # errors nobody is watching for.
+    err = schema_error()
+    if err:
+        raise HTTPException(status_code=503, detail=err)
+    return {"status": "ok", "version": APP_VERSION, "paragraphs": n}
 
 
 # ---------------------------------------------------------------------------
@@ -423,11 +481,7 @@ def search(
 
     # Build dynamic SQL. We start with a join over documents so all
     # filter chips work whether or not `q` is set.
-    select_cols = (
-        "p.rowid, p.para_id, p.doc_id, p.idx, p.n, p.section, p.text, "
-        "d.type, d.treaty, d.committee, d.mandate, d.country, d.year, d.communication_year, "
-        "d.adoption_date, d.signature, d.outcome, d.name, d.name_short, d.link"
-    )
+    select_cols = SEARCH_SELECT_COLS
     joins = ["JOIN documents d ON d.doc_id = p.doc_id"]
     where: list[str] = []
     params: list[Any] = []
