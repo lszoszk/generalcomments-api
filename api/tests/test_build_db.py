@@ -3,7 +3,22 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from build_db import SCHEMA, build, insert_document
+from build_db import SCHEMA, build, insert_document, insert_paragraph
+
+
+def test_footnotes_are_stored_for_display():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    insert_document(conn.cursor(), {"docId": "x", "type": "jur", "name": "X"})
+    insert_paragraph(
+        conn.cursor(),
+        {"id": "x-0001", "docId": "x", "idx": 1, "n": "8.2", "text": "Body.[[fn:8]]",
+         "footnotes": [{"n": 8, "text": "See general comment No. 16 (1988), para. 4."}]},
+        {"docId": "x", "name": "X"},
+    )
+    stored, flat = conn.execute("SELECT footnotes_json, footnotes_text FROM paragraphs").fetchone()
+    assert json.loads(stored) == [{"n": 8, "text": "See general comment No. 16 (1988), para. 4."}]
+    assert flat == "See general comment No. 16 (1988), para. 4."
 
 
 def test_jurisprudence_insert_uses_adoption_year():

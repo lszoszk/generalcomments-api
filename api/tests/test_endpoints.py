@@ -207,6 +207,21 @@ def test_document_full(client):
     assert body["paragraphs"][0]["idx"] == 1
 
 
+def test_document_returns_footnotes(client):
+    body = client.get("/api/document/crpd-c-34-d-103-2022").json()
+    first, second = body["paragraphs"]
+    assert first["footnotes"] == []
+    assert second["footnotes"] == [{"n": 3, "text": "See general comment No. 6 (2018), para. 24."}]
+    assert "[[fn:3]]" in second["text"]
+    assert "footnotes_json" not in second
+
+
+def test_paragraph_returns_footnotes(client):
+    body = client.get("/api/paragraph/crpd-c-34-d-103-2022-0002").json()
+    assert body["footnotes"][0]["n"] == 3
+    assert "footnotes_json" not in body
+
+
 def test_document_404(client):
     r = client.get("/api/document/does-not-exist")
     assert r.status_code == 404

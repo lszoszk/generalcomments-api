@@ -219,6 +219,16 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return {k: row[k] for k in row.keys()}
 
 
+def with_footnotes(para: dict) -> dict:
+    """Replace the stored footnotes_json with a decoded `footnotes` list.
+
+    Each item is {n, text}; n is the printed number the [[fn:N]] markers in
+    the text refer to."""
+    raw = para.pop("footnotes_json", None)
+    para["footnotes"] = json.loads(raw) if raw else []
+    return para
+
+
 # Hoisted out of search() so the schema probe below can test the EXACT
 # column list the endpoint depends on, rather than a hand-maintained copy
 # that would drift.
@@ -253,7 +263,7 @@ def schema_error() -> Optional[str]:
     try:
         with db_cursor() as cur:
             cur.execute(
-                f"SELECT {SEARCH_SELECT_COLS} FROM paragraphs p "
+                f"SELECT {SEARCH_SELECT_COLS}, p.footnotes_json FROM paragraphs p "
                 "JOIN documents d ON d.doc_id = p.doc_id LIMIT 0"
             )
         _schema_error = None
@@ -703,10 +713,10 @@ def get_document(doc_id: str, response: Response):
                 except Exception: pass
 
         cur.execute(
-            "SELECT para_id, idx, n, section, text FROM paragraphs WHERE doc_id = ? ORDER BY idx ASC",
+            "SELECT para_id, idx, n, section, text, footnotes_json FROM paragraphs WHERE doc_id = ? ORDER BY idx ASC",
             (doc_id,),
         )
-        paragraphs = [row_to_dict(r) for r in cur.fetchall()]
+        paragraphs = [with_footnotes(row_to_dict(r)) for r in cur.fetchall()]
 
         cur.execute(
             "SELECT DISTINCT pl.value FROM paragraph_label pl "
@@ -736,7 +746,7 @@ def get_paragraph(para_id: str, response: Response):
         r = cur.fetchone()
         if not r:
             raise HTTPException(status_code=404, detail=f"Unknown para_id: {para_id}")
-        para = row_to_dict(r)
+        para = with_footnotes(row_to_dict(r))
 
         cur.execute(
             "SELECT value FROM paragraph_label WHERE rowid = (SELECT rowid FROM paragraphs WHERE para_id = ?)",
