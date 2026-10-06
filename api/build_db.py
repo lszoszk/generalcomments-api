@@ -133,6 +133,16 @@ CREATE TABLE IF NOT EXISTS document_committee (
     value   TEXT NOT NULL
 );
 
+-- Jurisprudence paragraph ids are label-based ("<doc_id>:8.2"); every id
+-- published before (positional "<doc_id>-0037", or an earlier label)
+-- resolves here. new_id NULL: the old record was not a paragraph of the
+-- decision and is gone; doc_id still names its document.
+CREATE TABLE IF NOT EXISTS paragraph_redirect (
+    old_id  TEXT PRIMARY KEY,
+    new_id  TEXT,
+    doc_id  TEXT
+);
+
 -- Indexes that match the common WHERE clauses in /api/search.
 CREATE INDEX IF NOT EXISTS idx_paragraphs_doc_id     ON paragraphs(doc_id);
 CREATE INDEX IF NOT EXISTS idx_documents_type        ON documents(type);
@@ -324,6 +334,14 @@ def footnotes_json(p: dict) -> str | None:
     return json.dumps(out, ensure_ascii=False) if out else None
 
 
+def redirect_doc_id(old_id: str, new_id: str | None) -> str:
+    """The document an old paragraph id belongs to."""
+    for pid in (new_id, old_id):
+        if pid and ":" in pid:
+            return pid.split(":", 1)[0]
+    return re.sub(r"-\d{4}$", "", old_id)
+
+
 def insert_paragraph(cur, p: dict, doc: dict):
     """Insert one paragraph + its labels. Returns rowid."""
     # Some shards carry `section` as a string (per-paragraph heading) and
@@ -454,6 +472,18 @@ def build(src: Path, out_db: Path) -> dict:
                 insert_paragraph(cur, p, doc)
                 inserted_paragraphs += 1
             print(f"  {shard_path.name}: {inserted_paragraphs} paragraphs total")
+
+    # 5) Old jurisprudence paragraph ids -> current ones.
+    redirects_path = src / "jur" / "paragraph-redirects.json"
+    inserted_redirects = 0
+    if redirects_path.exists():
+        for old_id, new_id in read_json(redirects_path).get("redirects", {}).items():
+            cur.execute(
+                "INSERT INTO paragraph_redirect (old_id, new_id, doc_id) VALUES (?, ?, ?)",
+                (old_id, new_id, redirect_doc_id(old_id, new_id)),
+            )
+            inserted_redirects += 1
+        print(f"[build] {inserted_redirects} paragraph redirects")
 
     conn.commit()
 

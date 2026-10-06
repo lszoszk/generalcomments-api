@@ -58,6 +58,10 @@ CREATE TRIGGER paragraphs_ai AFTER INSERT ON paragraphs BEGIN
         VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
 END;
 CREATE TABLE paragraph_label (rowid INTEGER, value TEXT);
+CREATE TABLE paragraph_redirect (old_id TEXT PRIMARY KEY, new_id TEXT, doc_id TEXT);
+INSERT INTO paragraph_redirect VALUES
+    ('crpd-c-34-d-103-2022-0002', 'crpd-c-34-d-103-2022:2', 'crpd-c-34-d-103-2022'),
+    ('crpd-c-34-d-103-2022:25', NULL, 'crpd-c-34-d-103-2022');
 CREATE TABLE document_committee (doc_id TEXT, value TEXT);
 CREATE TABLE document_issue (doc_id TEXT, kind TEXT, value TEXT);
 CREATE TABLE document_article (doc_id TEXT, value TEXT);
@@ -83,9 +87,9 @@ PARAS = [
      "Reasonable accommodation is required to secure equality. The right to hold opinions is protected. For these reasons, safeguards matter."),
     ("crpd-c-gc-6-0002", "crpd-c-gc-6", 2, "2", None,
      "Discrimination on grounds of disability includes denial of reasonable accommodation."),
-    ("crpd-c-34-d-103-2022-0001", "crpd-c-34-d-103-2022", 1, "1", None,
+    ("crpd-c-34-d-103-2022:1", "crpd-c-34-d-103-2022", 1, "1", None,
      "The author argues that Spain failed to provide reasonable accommodation under article 12."),
-    ("crpd-c-34-d-103-2022-0002", "crpd-c-34-d-103-2022", 2, "2", None,
+    ("crpd-c-34-d-103-2022:2", "crpd-c-34-d-103-2022", 2, "2", None,
      "The Committee finds a violation of article 12 of the Convention.[[fn:3]]"),
     ("a-76-380-0001", "a-76-380", 1, "1", None,
      "The right to freedom of thought has long been overlooked in algorithmic discrimination contexts. The right to hold opinions includes forming them by way of reasoning."),
@@ -93,7 +97,7 @@ PARAS = [
 
 
 FOOTNOTES = {
-    "crpd-c-34-d-103-2022-0002": '[{"n": 3, "text": "See general comment No. 6 (2018), para. 24."}]',
+    "crpd-c-34-d-103-2022:2": '[{"n": 3, "text": "See general comment No. 6 (2018), para. 24."}]',
 }
 
 

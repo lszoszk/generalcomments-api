@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from build_db import SCHEMA, build, insert_document, insert_paragraph
+from build_db import SCHEMA, build, insert_document, insert_paragraph, redirect_doc_id
 
 
 def test_footnotes_are_stored_for_display():
@@ -155,3 +155,9 @@ def test_jurisprudence_taxonomies_become_filter_rows():
     assert conn.execute(
         "SELECT value FROM document_article ORDER BY value"
     ).fetchall() == [("Art. 12",), ("Art. 13",)]
+
+
+def test_redirect_doc_id():
+    assert redirect_doc_id("ccpr-c-50-d-488-1992-0037", "ccpr-c-50-d-488-1992:8.3") == "ccpr-c-50-d-488-1992"
+    assert redirect_doc_id("ccpr-c-50-d-488-1992:25", None) == "ccpr-c-50-d-488-1992"
+    assert redirect_doc_id("ccpr-c-50-d-488-1992-0001", None) == "ccpr-c-50-d-488-1992"

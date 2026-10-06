@@ -92,7 +92,7 @@ def test_search_boolean(client):
     assert "( " in body["ftsExpr"]                 # paren group preserved
     # The Spain paragraph should be excluded.
     ids = [h["para_id"] for h in body["hits"]]
-    assert "crpd-c-34-d-103-2022-0001" not in ids
+    assert "crpd-c-34-d-103-2022:1" not in ids
 
 
 def test_search_does_not_stem_bare_words(client):
@@ -217,9 +217,29 @@ def test_document_returns_footnotes(client):
 
 
 def test_paragraph_returns_footnotes(client):
-    body = client.get("/api/paragraph/crpd-c-34-d-103-2022-0002").json()
+    body = client.get("/api/paragraph/crpd-c-34-d-103-2022:2").json()
     assert body["footnotes"][0]["n"] == 3
     assert "footnotes_json" not in body
+    assert "redirected_from" not in body
+
+
+def test_old_paragraph_id_resolves_to_the_current_one(client):
+    r = client.get("/api/paragraph/crpd-c-34-d-103-2022-0002")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["para_id"] == "crpd-c-34-d-103-2022:2"
+    assert body["redirected_from"] == "crpd-c-34-d-103-2022-0002"
+    assert body["text"].startswith("The Committee finds a violation")
+
+
+def test_removed_paragraph_id_names_its_document(client):
+    r = client.get("/api/paragraph/crpd-c-34-d-103-2022:25")
+    assert r.status_code == 404
+    assert r.json() == {
+        "detail": "Paragraph crpd-c-34-d-103-2022:25 was removed: it was not a paragraph of the decision",
+        "doc_id": "crpd-c-34-d-103-2022",
+        "removed": True,
+    }
 
 
 def test_document_404(client):
