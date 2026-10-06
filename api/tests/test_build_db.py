@@ -161,3 +161,17 @@ def test_redirect_doc_id():
     assert redirect_doc_id("ccpr-c-50-d-488-1992-0037", "ccpr-c-50-d-488-1992:8.3") == "ccpr-c-50-d-488-1992"
     assert redirect_doc_id("ccpr-c-50-d-488-1992:25", None) == "ccpr-c-50-d-488-1992"
     assert redirect_doc_id("ccpr-c-50-d-488-1992-0001", None) == "ccpr-c-50-d-488-1992"
+
+
+def test_pdf_footnote_marks_are_kept():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    insert_document(conn.cursor(), {"docId": "x", "type": "jur", "name": "X"})
+    insert_paragraph(
+        conn.cursor(),
+        {"id": "x:9", "docId": "x", "idx": 1, "n": "9", "text": "Body.",
+         "footnotes": [{"n": 1, "text": "An opposition movement.", "mark": "a/", "anchored": False}]},
+        {"docId": "x", "name": "X"},
+    )
+    stored = conn.execute("SELECT footnotes_json FROM paragraphs").fetchone()[0]
+    assert json.loads(stored) == [{"n": 1, "text": "An opposition movement.", "mark": "a/", "anchored": False}]

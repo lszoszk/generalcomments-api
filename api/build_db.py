@@ -317,8 +317,10 @@ def flatten_footnotes(p: dict) -> str:
 def footnotes_json(p: dict) -> str | None:
     """The paragraph's footnotes as JSON [{n, text}], for /api/document.
 
-    n is the printed footnote number, matching the [[fn:N]] markers in the
-    text. Bare-string footnotes (no number) keep n = null."""
+    n is the number the [[fn:N]] markers in the text use. PDF notes may add
+    `mark` (the printed mark, "a/") and `anchored: false` (a note no legible
+    reference points to, kept on the decision's last paragraph). Bare-string
+    footnotes (no number) keep n = null."""
     fns = p.get("footnotes")
     if not fns or isinstance(fns, str):
         return None
@@ -326,11 +328,12 @@ def footnotes_json(p: dict) -> str | None:
     for f in fns:
         if isinstance(f, dict):
             t = f.get("text") or f.get("body") or f.get("content") or ""
-            n = f.get("n")
+            item = {"n": f.get("n"), "text": t}
+            item.update({k: f[k] for k in ("mark", "anchored") if k in f})
         else:
-            t, n = str(f), None
+            t, item = str(f), {"n": None, "text": str(f)}
         if t:
-            out.append({"n": n, "text": t})
+            out.append(item)
     return json.dumps(out, ensure_ascii=False) if out else None
 
 
