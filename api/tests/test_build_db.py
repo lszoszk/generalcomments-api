@@ -3,7 +3,22 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from build_db import SCHEMA, build, insert_document
+from build_db import SCHEMA, build, insert_document, insert_paragraph, redirect_doc_id
+
+
+def test_footnotes_are_stored_for_display():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    insert_document(conn.cursor(), {"docId": "x", "type": "jur", "name": "X"})
+    insert_paragraph(
+        conn.cursor(),
+        {"id": "x-0001", "docId": "x", "idx": 1, "n": "8.2", "text": "Body.[[fn:8]]",
+         "footnotes": [{"n": 8, "text": "See general comment No. 16 (1988), para. 4."}]},
+        {"docId": "x", "name": "X"},
+    )
+    stored, flat = conn.execute("SELECT footnotes_json, footnotes_text FROM paragraphs").fetchone()
+    assert json.loads(stored) == [{"n": 8, "text": "See general comment No. 16 (1988), para. 4."}]
+    assert flat == "See general comment No. 16 (1988), para. 4."
 
 
 def test_jurisprudence_insert_uses_adoption_year():
@@ -140,3 +155,23 @@ def test_jurisprudence_taxonomies_become_filter_rows():
     assert conn.execute(
         "SELECT value FROM document_article ORDER BY value"
     ).fetchall() == [("Art. 12",), ("Art. 13",)]
+
+
+def test_redirect_doc_id():
+    assert redirect_doc_id("ccpr-c-50-d-488-1992-0037", "ccpr-c-50-d-488-1992:8.3") == "ccpr-c-50-d-488-1992"
+    assert redirect_doc_id("ccpr-c-50-d-488-1992:25", None) == "ccpr-c-50-d-488-1992"
+    assert redirect_doc_id("ccpr-c-50-d-488-1992-0001", None) == "ccpr-c-50-d-488-1992"
+
+
+def test_pdf_footnote_marks_are_kept():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    insert_document(conn.cursor(), {"docId": "x", "type": "jur", "name": "X"})
+    insert_paragraph(
+        conn.cursor(),
+        {"id": "x:9", "docId": "x", "idx": 1, "n": "9", "text": "Body.",
+         "footnotes": [{"n": 1, "text": "An opposition movement.", "mark": "a/", "anchored": False}]},
+        {"docId": "x", "name": "X"},
+    )
+    stored = conn.execute("SELECT footnotes_json FROM paragraphs").fetchone()[0]
+    assert json.loads(stored) == [{"n": 1, "text": "An opposition movement.", "mark": "a/", "anchored": False}]

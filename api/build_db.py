@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS paragraphs (
     -- Denormalised columns powering FTS5 BM25F:
     title              TEXT,                     -- copy of documents.name_short
     treaty_committee   TEXT,                     -- "CRPD · GC6" / "CEDAW · 103/2022"
-    footnotes_text     TEXT                      -- concatenated footnote bodies (FTS only; never returned)
+    footnotes_text     TEXT,                     -- concatenated footnote bodies (FTS only; never returned)
+    footnotes_json     TEXT                      -- JSON [{n, text}] for display; not indexed
 );
 
 -- FTS5 virtual table — four columns ranked by built-in BM25 with
@@ -130,6 +131,16 @@ CREATE TABLE IF NOT EXISTS paragraph_label (
 CREATE TABLE IF NOT EXISTS document_committee (
     doc_id  TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
     value   TEXT NOT NULL
+);
+
+-- Jurisprudence paragraph ids are label-based ("<doc_id>:8.2"); every id
+-- published before (positional "<doc_id>-0037", or an earlier label)
+-- resolves here. new_id NULL: the old record was not a paragraph of the
+-- decision and is gone; doc_id still names its document.
+CREATE TABLE IF NOT EXISTS paragraph_redirect (
+    old_id  TEXT PRIMARY KEY,
+    new_id  TEXT,
+    doc_id  TEXT
 );
 
 -- Indexes that match the common WHERE clauses in /api/search.
@@ -303,6 +314,37 @@ def flatten_footnotes(p: dict) -> str:
     return " \n ".join(parts)
 
 
+def footnotes_json(p: dict) -> str | None:
+    """The paragraph's footnotes as JSON [{n, text}], for /api/document.
+
+    n is the number the [[fn:N]] markers in the text use. PDF notes may add
+    `mark` (the printed mark, "a/") and `anchored: false` (a note no legible
+    reference points to, kept on the decision's last paragraph). Bare-string
+    footnotes (no number) keep n = null."""
+    fns = p.get("footnotes")
+    if not fns or isinstance(fns, str):
+        return None
+    out = []
+    for f in fns:
+        if isinstance(f, dict):
+            t = f.get("text") or f.get("body") or f.get("content") or ""
+            item = {"n": f.get("n"), "text": t}
+            item.update({k: f[k] for k in ("mark", "anchored") if k in f})
+        else:
+            t, item = str(f), {"n": None, "text": str(f)}
+        if t:
+            out.append(item)
+    return json.dumps(out, ensure_ascii=False) if out else None
+
+
+def redirect_doc_id(old_id: str, new_id: str | None) -> str:
+    """The document an old paragraph id belongs to."""
+    for pid in (new_id, old_id):
+        if pid and ":" in pid:
+            return pid.split(":", 1)[0]
+    return re.sub(r"-\d{4}$", "", old_id)
+
+
 def insert_paragraph(cur, p: dict, doc: dict):
     """Insert one paragraph + its labels. Returns rowid."""
     # Some shards carry `section` as a string (per-paragraph heading) and
@@ -315,8 +357,9 @@ def insert_paragraph(cur, p: dict, doc: dict):
         section_val = str(section_val)
     cur.execute(
         """INSERT INTO paragraphs (
-            para_id, doc_id, idx, n, section, text, title, treaty_committee, footnotes_text
-        ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            para_id, doc_id, idx, n, section, text, title, treaty_committee, footnotes_text,
+            footnotes_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (
             p.get("id") or p.get("paragraphId"),
             p.get("docId"),
@@ -327,6 +370,7 @@ def insert_paragraph(cur, p: dict, doc: dict):
             doc.get("nameShort") or doc.get("name") or doc.get("docId"),
             sniff_doc_committee_string(doc),
             flatten_footnotes(p),
+            footnotes_json(p),
         ),
     )
     rowid = cur.lastrowid
@@ -432,6 +476,18 @@ def build(src: Path, out_db: Path) -> dict:
                 inserted_paragraphs += 1
             print(f"  {shard_path.name}: {inserted_paragraphs} paragraphs total")
 
+    # 5) Old jurisprudence paragraph ids -> current ones.
+    redirects_path = src / "jur" / "paragraph-redirects.json"
+    inserted_redirects = 0
+    if redirects_path.exists():
+        for old_id, new_id in read_json(redirects_path).get("redirects", {}).items():
+            cur.execute(
+                "INSERT INTO paragraph_redirect (old_id, new_id, doc_id) VALUES (?, ?, ?)",
+                (old_id, new_id, redirect_doc_id(old_id, new_id)),
+            )
+            inserted_redirects += 1
+        print(f"[build] {inserted_redirects} paragraph redirects")
+
     conn.commit()
 
     expected_sp = sum(
@@ -464,7 +520,7 @@ def write_manifest(out_dir: Path, counts: dict, db_path: Path, *, pretty: bool):
     manifest = {
         "version": datetime.now(timezone.utc).strftime("%Y%m%d"),
         "builtAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "schema": "1.1",
+        "schema": "1.2",
         "tokenizer": "unicode61",
         "fts_columns": ["title", "treaty_committee", "text", "footnotes_text"],
         "counts": counts,

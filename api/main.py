@@ -39,6 +39,7 @@ from contextlib import contextmanager
 from typing import Any, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
@@ -219,6 +220,16 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return {k: row[k] for k in row.keys()}
 
 
+def with_footnotes(para: dict) -> dict:
+    """Replace the stored footnotes_json with a decoded `footnotes` list.
+
+    Each item is {n, text}; n is the printed number the [[fn:N]] markers in
+    the text refer to."""
+    raw = para.pop("footnotes_json", None)
+    para["footnotes"] = json.loads(raw) if raw else []
+    return para
+
+
 # Hoisted out of search() so the schema probe below can test the EXACT
 # column list the endpoint depends on, rather than a hand-maintained copy
 # that would drift.
@@ -253,9 +264,10 @@ def schema_error() -> Optional[str]:
     try:
         with db_cursor() as cur:
             cur.execute(
-                f"SELECT {SEARCH_SELECT_COLS} FROM paragraphs p "
+                f"SELECT {SEARCH_SELECT_COLS}, p.footnotes_json FROM paragraphs p "
                 "JOIN documents d ON d.doc_id = p.doc_id LIMIT 0"
             )
+            cur.execute("SELECT old_id, new_id, doc_id FROM paragraph_redirect LIMIT 0")
         _schema_error = None
     except sqlite3.OperationalError as exc:
         _schema_error = (
@@ -703,10 +715,10 @@ def get_document(doc_id: str, response: Response):
                 except Exception: pass
 
         cur.execute(
-            "SELECT para_id, idx, n, section, text FROM paragraphs WHERE doc_id = ? ORDER BY idx ASC",
+            "SELECT para_id, idx, n, section, text, footnotes_json FROM paragraphs WHERE doc_id = ? ORDER BY idx ASC",
             (doc_id,),
         )
-        paragraphs = [row_to_dict(r) for r in cur.fetchall()]
+        paragraphs = [with_footnotes(row_to_dict(r)) for r in cur.fetchall()]
 
         cur.execute(
             "SELECT DISTINCT pl.value FROM paragraph_label pl "
@@ -723,8 +735,26 @@ def get_document(doc_id: str, response: Response):
 # ---------------------------------------------------------------------------
 @app.get("/api/paragraph/{para_id}")
 def get_paragraph(para_id: str, response: Response):
+    """One paragraph. An old jurisprudence id (positional "<doc_id>-0037" or
+    an earlier label) answers with the current paragraph and
+    `redirected_from`; one whose record was dropped answers 404 with the
+    document's id and `removed: true`."""
     _set_cache(response, "/api/paragraph")
+    redirected_from = None
     with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM paragraphs WHERE para_id = ?", (para_id,))
+        if not cur.fetchone():
+            cur.execute("SELECT new_id, doc_id FROM paragraph_redirect WHERE old_id = ?", (para_id,))
+            hit = cur.fetchone()
+            if hit and hit["new_id"] is None:
+                return JSONResponse(status_code=404, content={
+                    "detail": f"Paragraph {para_id} was removed: it was not a paragraph of the decision",
+                    "doc_id": hit["doc_id"],
+                    "removed": True,
+                })
+            if hit:
+                redirected_from, para_id = para_id, hit["new_id"]
+
         cur.execute(
             "SELECT p.*, d.type, d.treaty, d.committee, d.mandate, d.country, "
             "       d.year, d.communication_year, d.adoption_date, d.signature, "
@@ -736,13 +766,15 @@ def get_paragraph(para_id: str, response: Response):
         r = cur.fetchone()
         if not r:
             raise HTTPException(status_code=404, detail=f"Unknown para_id: {para_id}")
-        para = row_to_dict(r)
+        para = with_footnotes(row_to_dict(r))
 
         cur.execute(
             "SELECT value FROM paragraph_label WHERE rowid = (SELECT rowid FROM paragraphs WHERE para_id = ?)",
             (para_id,),
         )
         para["labels"] = [row["value"] for row in cur.fetchall()]
+    if redirected_from:
+        para["redirected_from"] = redirected_from
     return para
 
 
