@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS documents (
     communication_year INTEGER,            -- JUR communication number year
     adoption_date   TEXT,                 -- "21 Nov 1997" or YYYY where unknown
     outcome         TEXT,                 -- JUR only (violation, inadmissible…)
+    decision_type   TEXT,                 -- JUR only — juris.ohchr.org type of decision
     link            TEXT,                 -- canonical un.org / ohchr.org URL
     paragraph_count INTEGER,
     case_labels     TEXT,                 -- JSON array (JUR concerned groups)
@@ -141,6 +142,21 @@ CREATE INDEX IF NOT EXISTS idx_documents_country     ON documents(country);
 CREATE INDEX IF NOT EXISTS idx_documents_outcome     ON documents(outcome);
 CREATE INDEX IF NOT EXISTS idx_label_value           ON paragraph_label(value, rowid);
 CREATE INDEX IF NOT EXISTS idx_doc_committee_value   ON document_committee(value, doc_id);
+
+-- JUR document-level taxonomy (juris.ohchr.org substantive/procedural issues)
+-- and articles cited, as filterable rows so /api/search can narrow by them.
+CREATE TABLE IF NOT EXISTS document_issue (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id),
+    kind   TEXT NOT NULL,                 -- 'substantive' | 'procedural'
+    value  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_article (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id),
+    value  TEXT NOT NULL                  -- "Art. 7" (articlesCited)
+);
+CREATE INDEX IF NOT EXISTS idx_documents_decision_type ON documents(decision_type);
+CREATE INDEX IF NOT EXISTS idx_doc_issue_value      ON document_issue(kind, value, doc_id);
+CREATE INDEX IF NOT EXISTS idx_doc_article_value    ON document_article(value, doc_id);
 """
 
 
@@ -210,10 +226,10 @@ def insert_document(cur, d: dict):
     cur.execute(
         """INSERT OR REPLACE INTO documents (
             doc_id, type, treaty, committee, mandate, name, name_short, signature,
-            country, year, communication_year, adoption_date, outcome, link, paragraph_count,
+            country, year, communication_year, adoption_date, outcome, decision_type, link, paragraph_count,
             case_labels, abstract, status, superseded_by, report_type, presented,
             articles_cited, last_verified, word_count, label_count
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             d.get("docId"),
             d.get("type"),
@@ -228,6 +244,7 @@ def insert_document(cur, d: dict):
             (d.get("communicationYear") or d.get("year")) if d.get("type") == "jur" else None,
             document_adoption_date(d),
             d.get("outcome"),
+            d.get("jurisDecisionType"),
             d.get("link"),
             d.get("paragraphCount"),
             json.dumps(d.get("caseLabels") or [], ensure_ascii=False) if d.get("caseLabels") else None,
@@ -242,6 +259,17 @@ def insert_document(cur, d: dict):
             d.get("labelCount"),
         ),
     )
+    # JUR taxonomy + cited articles as filterable rows (see /api/search).
+    if d.get("type") == "jur":
+        cur.execute("DELETE FROM document_issue WHERE doc_id = ?", (d.get("docId"),))
+        cur.execute("DELETE FROM document_article WHERE doc_id = ?", (d.get("docId"),))
+        for kind, key in (("substantive", "jurisSubstantiveIssues"), ("procedural", "jurisProceduralIssues")):
+            for v in (d.get(key) or []):
+                if v:
+                    cur.execute("INSERT INTO document_issue (doc_id, kind, value) VALUES (?,?,?)", (d.get("docId"), kind, str(v)))
+        for v in (d.get("articlesCited") or []):
+            if v:
+                cur.execute("INSERT INTO document_article (doc_id, value) VALUES (?,?)", (d.get("docId"), str(v)))
     # Many-to-many committee list (mainly defensive — most docs have a
     # single committee, but SP can have e.g. ["SR Privacy", "SR Religion"]).
     for committee in d.get("committees") or []:

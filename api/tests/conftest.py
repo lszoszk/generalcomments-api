@@ -38,7 +38,7 @@ SCHEMA = """
 CREATE TABLE documents (
     doc_id TEXT PRIMARY KEY, type TEXT NOT NULL, treaty TEXT, committee TEXT,
     mandate TEXT, name TEXT, name_short TEXT, signature TEXT, country TEXT,
-    year INTEGER, communication_year INTEGER, adoption_date TEXT, outcome TEXT, link TEXT,
+    year INTEGER, communication_year INTEGER, adoption_date TEXT, outcome TEXT, decision_type TEXT, link TEXT,
     paragraph_count INTEGER, case_labels TEXT, abstract TEXT, status TEXT,
     superseded_by TEXT, report_type TEXT, presented TEXT, articles_cited TEXT,
     last_verified TEXT, word_count INTEGER, label_count INTEGER
@@ -59,6 +59,8 @@ CREATE TRIGGER paragraphs_ai AFTER INSERT ON paragraphs BEGIN
 END;
 CREATE TABLE paragraph_label (rowid INTEGER, value TEXT);
 CREATE TABLE document_committee (doc_id TEXT, value TEXT);
+CREATE TABLE document_issue (doc_id TEXT, kind TEXT, value TEXT);
+CREATE TABLE document_article (doc_id TEXT, value TEXT);
 """
 
 # Minimal corpus: one of each scope type with a couple of paragraphs.
@@ -71,7 +73,7 @@ DOCS = [
          country="Spain", outcome="violation_found",
          name="Communication No. 103/2022", name_short="103/2022",
          signature="CRPD/C/34/D/103/2022", year=2024, communication_year=2022,
-         adoption_date="29 August 2024", paragraph_count=2),
+         adoption_date="29 August 2024", decision_type="Views", paragraph_count=2),
     dict(doc_id="a-76-380", type="sp", mandate="SR Freedom of Religion or Belief",
          name="The Freedom of Thought", name_short="Freedom of Thought",
          signature="A/76/380", year=2021, paragraph_count=1),
@@ -107,6 +109,15 @@ def fixture_db():
             (para_id, doc_id, idx, n, section, text,
              doc["name_short"], f"{doc.get('treaty') or doc.get('mandate')} · {doc['signature']}", ""),
         )
+    cur.executemany(
+        "INSERT INTO document_issue (doc_id, kind, value) VALUES (?,?,?)",
+        [("crpd-c-34-d-103-2022", "substantive", "Equal recognition before the law"),
+         ("crpd-c-34-d-103-2022", "procedural", "Exhaustion of domestic remedies")],
+    )
+    cur.execute(
+        "INSERT INTO document_article (doc_id, value) VALUES (?,?)",
+        ("crpd-c-34-d-103-2022", "Art. 12"),
+    )
     conn.commit()
     conn.close()
     yield _DB_PATH

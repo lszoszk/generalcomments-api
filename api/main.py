@@ -382,6 +382,32 @@ def facets(response: Response, scope: str = Query("all", pattern="^(all|gc|jur|s
         outcomes = [row_to_dict(r) for r in cur.fetchall()]
 
         cur.execute(
+            f"SELECT decision_type AS value, count(*) AS count FROM documents "
+            f"WHERE decision_type IS NOT NULL {type_filter} GROUP BY decision_type ORDER BY count DESC",
+            params,
+        )
+        decision_types = [row_to_dict(r) for r in cur.fetchall()]
+
+        doc_filter = type_filter.replace("AND type", "AND d.type")
+        cur.execute(
+            f"SELECT di.kind, di.value, count(*) AS count FROM document_issue di "
+            f"JOIN documents d ON d.doc_id = di.doc_id WHERE 1=1 {doc_filter} "
+            f"GROUP BY di.kind, di.value ORDER BY count DESC",
+            params,
+        )
+        issue_rows = [row_to_dict(r) for r in cur.fetchall()]
+        substantive_issues = [{"value": r["value"], "count": r["count"]} for r in issue_rows if r["kind"] == "substantive"]
+        procedural_issues = [{"value": r["value"], "count": r["count"]} for r in issue_rows if r["kind"] == "procedural"]
+
+        cur.execute(
+            f"SELECT da.value, count(*) AS count FROM document_article da "
+            f"JOIN documents d ON d.doc_id = da.doc_id WHERE 1=1 {doc_filter} "
+            f"GROUP BY da.value ORDER BY count DESC",
+            params,
+        )
+        articles = [row_to_dict(r) for r in cur.fetchall()]
+
+        cur.execute(
             f"SELECT pl.value, count(*) AS count "
             f"FROM paragraph_label pl JOIN paragraphs p ON p.rowid = pl.rowid "
             f"JOIN documents d ON d.doc_id = p.doc_id "
@@ -409,6 +435,10 @@ def facets(response: Response, scope: str = Query("all", pattern="^(all|gc|jur|s
         "mandates": mandates,
         "countries": countries,
         "outcomes": outcomes,
+        "decisionTypes": decision_types,
+        "substantiveIssues": substantive_issues,
+        "proceduralIssues": procedural_issues,
+        "articles": articles,
         "labels": labels,
         "years": years,
     }
@@ -443,6 +473,10 @@ def search(
     mandates: Optional[str] = None,
     countries: Optional[str] = None,
     outcomes: Optional[str] = None,
+    decision_types: Optional[str] = Query(None, description="Pipe-separated juris.ohchr.org decision types (values may contain commas)"),
+    substantive_issues: Optional[str] = Query(None, description="Pipe-separated substantive issues (juris.ohchr.org taxonomy); ANY match"),
+    procedural_issues: Optional[str] = Query(None, description="Pipe-separated procedural issues; ANY match"),
+    articles: Optional[str] = Query(None, description="Pipe-separated cited articles ('Art. 7'); ANY match"),
     labels: Optional[str] = None,
     labels_mode: str = Query(
         "any",
@@ -460,8 +494,9 @@ def search(
         False,
         description=(
             "Include footnote text in the match. Default false (body only). "
-            "When false the FTS MATCH is column-filtered to the body columns "
-            "(title/treaty_committee/text) so footnote-only hits are excluded."
+            "The FTS MATCH is column-filtered to the paragraph text (plus "
+            "footnotes_text when true): the document title and the body name "
+            "stay in the index for ranking but never make a paragraph match."
         ),
     ),
     page: int = Query(1, ge=1),
@@ -475,9 +510,17 @@ def search(
     treaty_list = parse_csv(treaties)
     committee_list = parse_csv(committees)
     mandate_list = parse_csv(mandates)
-    country_list = parse_csv(countries)
+    # A leading "|" switches the list to pipe mode: joint communications
+    # carry comma-joined respondent States ("Afghanistan,Sweden").
+    country_list = ([v.strip() for v in countries[1:].split("|") if v.strip()]
+                    if countries and countries.startswith("|") else parse_csv(countries))
     outcome_list = parse_csv(outcomes)
     label_list = parse_csv(labels)
+    parse_pipe = lambda s: [v.strip() for v in (s or "").split("|") if v.strip()]
+    decision_type_list = parse_pipe(decision_types)
+    substantive_issue_list = parse_pipe(substantive_issues)
+    procedural_issue_list = parse_pipe(procedural_issues)
+    article_list = parse_pipe(articles)
 
     # Build dynamic SQL. We start with a join over documents so all
     # filter chips work whether or not `q` is set.
@@ -489,13 +532,15 @@ def search(
     if fts_expr:
         joins.append("JOIN paragraphs_fts ON paragraphs_fts.rowid = p.rowid")
         where.append("paragraphs_fts MATCH ?")
-        # Footnote search is opt-in (default off). When disabled, restrict the
-        # match to the body columns so footnote-only hits (e.g. case citations
-        # held in footnotes_text) are excluded. bm25 column weights are
-        # unaffected — footnotes_text simply never matches.
+        # The match is the paragraph's own words. Until 2026-09-08 the title
+        # and treaty_committee columns were in the filter, so every paragraph
+        # of a report whose TITLE carried the query terms matched ("children
+        # AND trafficking" returned all 55 paragraphs of A/72/164, headings
+        # included, with nothing to highlight). Footnote search is opt-in:
+        # footnotes_text joins the filter only when requested.
         params.append(
-            fts_expr if footnotes
-            else f"{{title treaty_committee text}} : ({fts_expr})"
+            f"{{text footnotes_text}} : ({fts_expr})" if footnotes
+            else f"{{text}} : ({fts_expr})"
         )
 
     if scope != "all":
@@ -526,6 +571,18 @@ def search(
     if mandate_list:   in_clause("d.mandate", mandate_list)
     if country_list:   in_clause("d.country", country_list)
     if outcome_list:   in_clause("d.outcome", outcome_list)
+    if decision_type_list: in_clause("d.decision_type", decision_type_list)
+    # Document-level taxonomies: EXISTS keeps one row per paragraph even when
+    # several selected values match the same case.
+    for kind, values in (("substantive", substantive_issue_list), ("procedural", procedural_issue_list)):
+        if values:
+            ph = ",".join("?" for _ in values)
+            where.append(f"EXISTS (SELECT 1 FROM document_issue di WHERE di.doc_id = d.doc_id AND di.kind = ? AND di.value IN ({ph}))")
+            params.append(kind); params.extend(values)
+    if article_list:
+        ph = ",".join("?" for _ in article_list)
+        where.append(f"EXISTS (SELECT 1 FROM document_article da WHERE da.doc_id = d.doc_id AND da.value IN ({ph}))")
+        params.extend(article_list)
     if year_from is not None:
         where.append("d.year >= ?"); params.append(year_from)
     if year_to is not None:

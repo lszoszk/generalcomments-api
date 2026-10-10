@@ -112,3 +112,31 @@ def test_build_reads_special_procedures_shards(tmp_path):
     assert counts["paragraphs"] == 1
     with sqlite3.connect(out_db) as conn:
         assert conn.execute("SELECT count(*) FROM paragraphs").fetchone()[0] == 1
+
+
+def test_jurisprudence_taxonomies_become_filter_rows():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    doc = {
+        "docId": "crpd-c-31-d-94-2021",
+        "type": "jur",
+        "year": 2024,
+        "jurisDecisionType": "Views",
+        "jurisSubstantiveIssues": ["Equal recognition before the law", ""],
+        "jurisProceduralIssues": ["Exhaustion of domestic remedies"],
+        "articlesCited": ["Art. 12", "Art. 13"],
+    }
+    insert_document(conn.cursor(), doc)
+    # Re-inserting the same document replaces its rows rather than doubling them.
+    insert_document(conn.cursor(), doc)
+
+    assert conn.execute("SELECT decision_type FROM documents").fetchone() == ("Views",)
+    assert conn.execute(
+        "SELECT kind, value FROM document_issue ORDER BY kind"
+    ).fetchall() == [
+        ("procedural", "Exhaustion of domestic remedies"),
+        ("substantive", "Equal recognition before the law"),
+    ]
+    assert conn.execute(
+        "SELECT value FROM document_article ORDER BY value"
+    ).fetchall() == [("Art. 12",), ("Art. 13",)]

@@ -1,6 +1,8 @@
 """Happy-path tests for every public endpoint."""
 from __future__ import annotations
 
+import pytest
+
 
 def test_health_ok(client):
     r = client.get("/health")
@@ -31,6 +33,46 @@ def test_facets_filtered_by_scope(client):
     assert any(c["value"] == "Spain" for c in body["countries"])
     assert any(o["value"] == "violation_found" for o in body["outcomes"])
 
+
+
+def test_facets_include_juris_taxonomies(client):
+    body = client.get("/api/facets?scope=jur").json()
+    assert body["decisionTypes"] == [{"value": "Views", "count": 1}]
+    assert body["substantiveIssues"] == [{"value": "Equal recognition before the law", "count": 1}]
+    assert body["proceduralIssues"] == [{"value": "Exhaustion of domestic remedies", "count": 1}]
+    assert body["articles"] == [{"value": "Art. 12", "count": 1}]
+    gc_only = client.get("/api/facets?scope=gc").json()
+    assert gc_only["decisionTypes"] == gc_only["articles"] == []
+
+
+@pytest.mark.parametrize("params", [
+    {"decision_types": "Views"},
+    {"substantive_issues": "Other issue|Equal recognition before the law"},
+    {"procedural_issues": "Exhaustion of domestic remedies"},
+    {"articles": "Art. 12"},
+    {"countries": "|Spain|Afghanistan,Sweden"},
+])
+def test_search_juris_filters_match(client, params):
+    body = client.get("/api/search", params={"q": "violation", **params}).json()
+    assert body["total"] >= 1
+    assert {h["doc_id"] for h in body["hits"]} == {"crpd-c-34-d-103-2022"}
+
+
+@pytest.mark.parametrize("params", [
+    {"decision_types": "Inadmissibility decision"},
+    # kind matters: a substantive value under procedural_issues does not match
+    {"procedural_issues": "Equal recognition before the law"},
+    {"articles": "Art. 5"},
+])
+def test_search_juris_filters_exclude(client, params):
+    body = client.get("/api/search", params={"q": "violation", **params}).json()
+    assert body["total"] == 0
+
+
+def test_search_does_not_match_on_title_alone(client):
+    """'GC6' appears only in the document title, never in paragraph text."""
+    body = client.get("/api/search", params={"q": "GC6"}).json()
+    assert body["total"] == 0
 
 def test_search_keyword(client):
     r = client.get("/api/search?q=reasonable+accommodation")
