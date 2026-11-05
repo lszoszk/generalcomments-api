@@ -30,8 +30,8 @@ _BOOLEAN_TOKENS = {"AND", "OR", "NOT", "NEAR"}
 _TOKEN_RE = re.compile(
     r'"[^"]*"'                               # phrase, including the quotes
     r'|\([^()]*\)'                           # simple paren group
-    r'|[A-Za-z][A-Za-z0-9*]*\*'              # prefix wildcard token
-    r'|[A-Za-z][A-Za-z0-9_]*'                # bare word
+    r'|[^\W\d_][\w*]*\*'                     # prefix wildcard token (any script: "desaparici*")
+    r'|[^\W\d_]\w*'                          # bare word, accented letters included ("desaparición")
     r'|\d+'                                  # bare number
     r'|[()]'                                 # paren on its own (we'll keep)
 )
@@ -84,6 +84,8 @@ def build_fts_query(raw: str | None) -> str | None:
     '"trafficking" AND "children" NOT ( "sexual" )'
     >>> build_fts_query('discriminat*')
     'discriminat*'
+    >>> build_fts_query('desaparición forzada')
+    '"desaparición" "forzada"'
     """
     if not raw:
         return None

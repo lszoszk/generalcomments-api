@@ -239,6 +239,21 @@ SEARCH_SELECT_COLS = (
     "d.adoption_date, d.signature, d.outcome, d.name, d.name_short, d.link"
 )
 
+# lang=es: the official Spanish text of General Comment paragraphs
+# (paragraphs_es, same rowid as the English paragraph). Paragraphs without one
+# come back in English; every paragraph says which with `lang`. Footnotes
+# follow the text: a Spanish paragraph never shows the English notes, whose
+# [[fn:N]] markers it does not carry.
+LANG_QUERY = Query("en", pattern="^(en|es)$", description=(
+    "en (default) or es. es: General Comment paragraphs in their official Spanish text where "
+    "UNHRDB has it (search then matches the Spanish text); others stay English, marked lang='en'."))
+ES_JOIN = "LEFT JOIN paragraphs_es pe ON pe.rowid = p.rowid"
+ES_TEXT_COLS = (
+    "COALESCE(pe.section, p.section) AS section, COALESCE(pe.text, p.text) AS text, "
+    "CASE WHEN pe.rowid IS NULL THEN 'en' ELSE 'es' END AS lang"
+)
+ES_FOOTNOTES_COL = "CASE WHEN pe.rowid IS NULL THEN p.footnotes_json ELSE pe.footnotes_json END AS footnotes_json"
+
 _schema_error: Optional[str] = None
 _schema_checked = False
 
@@ -268,6 +283,9 @@ def schema_error() -> Optional[str]:
                 "JOIN documents d ON d.doc_id = p.doc_id LIMIT 0"
             )
             cur.execute("SELECT old_id, new_id, doc_id FROM paragraph_redirect LIMIT 0")
+            cur.execute("SELECT pe.rowid, pe.text, pe.section, pe.footnotes_json, d.name_es, d.name_short_es "
+                        "FROM paragraphs_es pe JOIN paragraphs p ON p.rowid = pe.rowid "
+                        "JOIN documents d ON d.doc_id = p.doc_id LIMIT 0")
         _schema_error = None
     except sqlite3.OperationalError as exc:
         _schema_error = (
@@ -513,6 +531,7 @@ def search(
     ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
+    lang: str = LANG_QUERY,
 ):
     _set_cache(response, "/api/search")
     t0 = time.perf_counter()
@@ -540,10 +559,16 @@ def search(
     joins = ["JOIN documents d ON d.doc_id = p.doc_id"]
     where: list[str] = []
     params: list[Any] = []
+    fts = "paragraphs_fts"
+    if lang == "es":
+        fts = "paragraphs_fts_es"
+        select_cols = (SEARCH_SELECT_COLS.replace("p.section, p.text, ", "")
+                       + ", d.name_es, d.name_short_es, " + ES_TEXT_COLS)
+        joins.append(ES_JOIN)
 
     if fts_expr:
-        joins.append("JOIN paragraphs_fts ON paragraphs_fts.rowid = p.rowid")
-        where.append("paragraphs_fts MATCH ?")
+        joins.append(f"JOIN {fts} ON {fts}.rowid = p.rowid")
+        where.append(f"{fts} MATCH ?")
         # The match is the paragraph's own words. Until 2026-09-08 the title
         # and treaty_committee columns were in the filter, so every paragraph
         # of a report whose TITLE carried the query terms matched ("children
@@ -630,7 +655,7 @@ def search(
     # Sorting. For relevance we use the FTS5 bm25() function with our
     # column weights; date_desc / date_asc fall back to documents.year.
     if sort == "relevance" and fts_expr:
-        order_sql = f" ORDER BY bm25(paragraphs_fts, {column_weights()}) ASC"
+        order_sql = f" ORDER BY bm25({fts}, {column_weights()}) ASC"
     elif sort == "date_asc":
         order_sql = " ORDER BY d.year ASC, p.idx ASC"
     else:
@@ -663,8 +688,8 @@ def search(
         if fts_expr:
             page_sql = (
                 f"SELECT {select_cols}, "
-                f"snippet(paragraphs_fts, 2, '<mark>', '</mark>', '…', 24) AS snippet, "
-                f"bm25(paragraphs_fts, {column_weights()}) AS score "
+                f"snippet({fts}, 2, '<mark>', '</mark>', '…', 24) AS snippet, "
+                f"bm25({fts}, {column_weights()}) AS score "
                 f"FROM paragraphs p{join_sql}{where_sql}{order_sql} LIMIT ? OFFSET ?"
             )
         else:
@@ -684,6 +709,7 @@ def search(
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     return {
         "query": q,
+        "lang": lang,
         "ftsExpr": fts_expr,
         "scope": scope,
         "total": total,
@@ -700,7 +726,7 @@ def search(
 # /api/document/{doc_id}
 # ---------------------------------------------------------------------------
 @app.get("/api/document/{doc_id}")
-def get_document(doc_id: str, response: Response):
+def get_document(doc_id: str, response: Response, lang: str = LANG_QUERY):
     _set_cache(response, "/api/document")
     with db_cursor() as cur:
         cur.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,))
@@ -714,10 +740,17 @@ def get_document(doc_id: str, response: Response):
                 try: doc[k] = json.loads(doc[k])
                 except Exception: pass
 
-        cur.execute(
-            "SELECT para_id, idx, n, section, text, footnotes_json FROM paragraphs WHERE doc_id = ? ORDER BY idx ASC",
-            (doc_id,),
-        )
+        if lang == "es":
+            cur.execute(
+                f"SELECT p.para_id, p.idx, p.n, {ES_TEXT_COLS}, {ES_FOOTNOTES_COL} "
+                f"FROM paragraphs p {ES_JOIN} WHERE p.doc_id = ? ORDER BY p.idx ASC",
+                (doc_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT para_id, idx, n, section, text, footnotes_json FROM paragraphs WHERE doc_id = ? ORDER BY idx ASC",
+                (doc_id,),
+            )
         paragraphs = [with_footnotes(row_to_dict(r)) for r in cur.fetchall()]
 
         cur.execute(
@@ -734,7 +767,7 @@ def get_document(doc_id: str, response: Response):
 # /api/paragraph/{para_id}
 # ---------------------------------------------------------------------------
 @app.get("/api/paragraph/{para_id}")
-def get_paragraph(para_id: str, response: Response):
+def get_paragraph(para_id: str, response: Response, lang: str = LANG_QUERY):
     """One paragraph. An old jurisprudence id (positional "<doc_id>-0037" or
     an earlier label) answers with the current paragraph and
     `redirected_from`; one whose record was dropped answers 404 with the
@@ -758,7 +791,7 @@ def get_paragraph(para_id: str, response: Response):
         cur.execute(
             "SELECT p.*, d.type, d.treaty, d.committee, d.mandate, d.country, "
             "       d.year, d.communication_year, d.adoption_date, d.signature, "
-            "       d.name, d.name_short, d.outcome, d.link "
+            "       d.name, d.name_short, d.outcome, d.link, d.name_es, d.name_short_es "
             "FROM paragraphs p JOIN documents d ON d.doc_id = p.doc_id "
             "WHERE p.para_id = ?",
             (para_id,),
@@ -766,7 +799,15 @@ def get_paragraph(para_id: str, response: Response):
         r = cur.fetchone()
         if not r:
             raise HTTPException(status_code=404, detail=f"Unknown para_id: {para_id}")
-        para = with_footnotes(row_to_dict(r))
+        para = row_to_dict(r)
+        if lang == "es":
+            cur.execute("SELECT section, text, footnotes_json FROM paragraphs_es WHERE para_id = ?", (para_id,))
+            es = cur.fetchone()
+            para["lang"] = "es" if es else "en"
+            if es:
+                para.update(text=es["text"], footnotes_json=es["footnotes_json"],
+                            section=es["section"] or para.get("section"))
+        para = with_footnotes(para)
 
         cur.execute(
             "SELECT value FROM paragraph_label WHERE rowid = (SELECT rowid FROM paragraphs WHERE para_id = ?)",

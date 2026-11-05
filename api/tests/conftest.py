@@ -41,7 +41,8 @@ CREATE TABLE documents (
     year INTEGER, communication_year INTEGER, adoption_date TEXT, outcome TEXT, decision_type TEXT, link TEXT,
     paragraph_count INTEGER, case_labels TEXT, abstract TEXT, status TEXT,
     superseded_by TEXT, report_type TEXT, presented TEXT, articles_cited TEXT,
-    last_verified TEXT, word_count INTEGER, label_count INTEGER
+    last_verified TEXT, word_count INTEGER, label_count INTEGER,
+    name_es TEXT, name_short_es TEXT, es_alignment TEXT
 );
 CREATE TABLE paragraphs (
     rowid INTEGER PRIMARY KEY, para_id TEXT NOT NULL UNIQUE,
@@ -55,6 +56,19 @@ CREATE VIRTUAL TABLE paragraphs_fts USING fts5(
 );
 CREATE TRIGGER paragraphs_ai AFTER INSERT ON paragraphs BEGIN
     INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text, footnotes_text)
+        VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
+END;
+CREATE TABLE paragraphs_es (
+    rowid INTEGER PRIMARY KEY, para_id TEXT NOT NULL UNIQUE, section TEXT,
+    text TEXT NOT NULL, title TEXT, treaty_committee TEXT,
+    footnotes_text TEXT, footnotes_json TEXT
+);
+CREATE VIRTUAL TABLE paragraphs_fts_es USING fts5(
+    title, treaty_committee, text, footnotes_text,
+    content='paragraphs_es', content_rowid='rowid', tokenize='unicode61'
+);
+CREATE TRIGGER paragraphs_es_ai AFTER INSERT ON paragraphs_es BEGIN
+    INSERT INTO paragraphs_fts_es(rowid, title, treaty_committee, text, footnotes_text)
         VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
 END;
 CREATE TABLE paragraph_label (rowid INTEGER, value TEXT);
@@ -72,7 +86,9 @@ DOCS = [
     dict(doc_id="crpd-c-gc-6", type="gc", treaty="CRPD", committee="CRPD",
          name="General Comment No. 6 (2018) on equality and non-discrimination",
          name_short="GC6: equality and non-discrimination", signature="CRPD/C/GC/6",
-         year=2018, adoption_date="26 April 2018", paragraph_count=2),
+         year=2018, adoption_date="26 April 2018", paragraph_count=2,
+         name_es="Observación general núm. 6 (2018) sobre la igualdad y la no discriminación",
+         name_short_es="OG6: Igualdad y no discriminación", es_alignment="partial"),
     dict(doc_id="crpd-c-34-d-103-2022", type="jur", treaty="CRPD", committee="CRPD",
          country="Spain", outcome="violation_found",
          name="Communication No. 103/2022", name_short="103/2022",
@@ -94,6 +110,14 @@ PARAS = [
     ("a-76-380-0001", "a-76-380", 1, "1", None,
      "The right to freedom of thought has long been overlooked in algorithmic discrimination contexts. The right to hold opinions includes forming them by way of reasoning."),
 ]
+
+
+# Spanish text of one GC paragraph (the other stays English, as a partial document does).
+PARAS_ES = {
+    "crpd-c-gc-6-0002": ("La discriminación por motivos de discapacidad incluye la denegación de ajustes "
+                         "razonables y la discriminación múltiple.[[fn:7]]",
+                         '[{"n": 7, "text": "Véase el artículo 2 de la Convención."}]'),
+}
 
 
 FOOTNOTES = {
@@ -118,6 +142,13 @@ def fixture_db():
             (para_id, doc_id, idx, n, section, text,
              doc["name_short"], f"{doc.get('treaty') or doc.get('mandate')} · {doc['signature']}", "",
              FOOTNOTES.get(para_id)),
+        )
+    for para_id, (text, notes) in PARAS_ES.items():
+        rowid = cur.execute("SELECT rowid FROM paragraphs WHERE para_id = ?", (para_id,)).fetchone()[0]
+        cur.execute(
+            "INSERT INTO paragraphs_es (rowid, para_id, text, title, treaty_committee, footnotes_text, footnotes_json) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (rowid, para_id, text, "OG6: Igualdad y no discriminación", "CRPD · CRPD/C/GC/6", "", notes),
         )
     cur.executemany(
         "INSERT INTO document_issue (doc_id, kind, value) VALUES (?,?,?)",

@@ -71,7 +71,10 @@ CREATE TABLE IF NOT EXISTS documents (
     articles_cited  TEXT,                 -- JSON array
     last_verified   TEXT,                 -- YYYY-MM-DD
     word_count      INTEGER,
-    label_count     INTEGER
+    label_count     INTEGER,
+    name_es         TEXT,                 -- GC only — official Spanish title
+    name_short_es   TEXT,                 -- GC only — Spanish catalogue-row title ("OG36: ...")
+    es_alignment    TEXT                  -- GC only — 'full' | 'partial' | 'none' (corpus.es.json)
 );
 
 CREATE TABLE IF NOT EXISTS paragraphs (
@@ -120,6 +123,37 @@ CREATE TRIGGER IF NOT EXISTS paragraphs_au AFTER UPDATE ON paragraphs BEGIN
        VALUES ('delete', old.rowid, old.title, old.treaty_committee, old.text, old.footnotes_text);
   INSERT INTO paragraphs_fts(rowid, title, treaty_committee, text, footnotes_text)
        VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
+END;
+
+-- Official Spanish text of General Comment paragraphs (docs/corpus.es.json).
+-- rowid = the English paragraph's rowid, so labels, document filters and the
+-- bm25 column weights apply unchanged; same four FTS columns as paragraphs_fts.
+CREATE TABLE IF NOT EXISTS paragraphs_es (
+    rowid              INTEGER PRIMARY KEY,
+    para_id            TEXT NOT NULL UNIQUE REFERENCES paragraphs(para_id),
+    section            TEXT,
+    text               TEXT NOT NULL,
+    title              TEXT,                     -- documents.name_short_es
+    treaty_committee   TEXT,
+    footnotes_text     TEXT,
+    footnotes_json     TEXT
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts_es USING fts5(
+    title,
+    treaty_committee,
+    text,
+    footnotes_text,
+    content       = 'paragraphs_es',
+    content_rowid = 'rowid',
+    tokenize      = 'unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS paragraphs_es_ai AFTER INSERT ON paragraphs_es BEGIN
+  INSERT INTO paragraphs_fts_es(rowid, title, treaty_committee, text, footnotes_text)
+       VALUES (new.rowid, new.title, new.treaty_committee, new.text, new.footnotes_text);
+END;
+CREATE TRIGGER IF NOT EXISTS paragraphs_es_ad AFTER DELETE ON paragraphs_es BEGIN
+  INSERT INTO paragraphs_fts_es(paragraphs_fts_es, rowid, title, treaty_committee, text, footnotes_text)
+       VALUES ('delete', old.rowid, old.title, old.treaty_committee, old.text, old.footnotes_text);
 END;
 
 -- Many-to-many lookups for filter chips.
@@ -239,8 +273,9 @@ def insert_document(cur, d: dict):
             doc_id, type, treaty, committee, mandate, name, name_short, signature,
             country, year, communication_year, adoption_date, outcome, decision_type, link, paragraph_count,
             case_labels, abstract, status, superseded_by, report_type, presented,
-            articles_cited, last_verified, word_count, label_count
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            articles_cited, last_verified, word_count, label_count,
+            name_es, name_short_es, es_alignment
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             d.get("docId"),
             d.get("type"),
@@ -268,6 +303,9 @@ def insert_document(cur, d: dict):
             d.get("lastVerifiedAt"),
             d.get("wordCount"),
             d.get("labelCount"),
+            d.get("nameEs"),
+            d.get("nameShortEs"),
+            d.get("esAlignment"),
         ),
     )
     # JUR taxonomy + cited articles as filterable rows (see /api/search).
@@ -476,6 +514,30 @@ def build(src: Path, out_db: Path) -> dict:
                 inserted_paragraphs += 1
             print(f"  {shard_path.name}: {inserted_paragraphs} paragraphs total")
 
+    # 4b) Spanish text of General Comment paragraphs, on the English rowids.
+    inserted_es = 0
+    es_path = src / "corpus.es.json"
+    if es_path.exists():
+        print("[build] reading corpus.es.json …")
+        for p in read_json(es_path):
+            row = cur.execute("SELECT rowid, doc_id, treaty_committee FROM paragraphs WHERE para_id = ?",
+                              (p.get("id"),)).fetchone()
+            if not row:
+                continue
+            doc = docs_by_id.get(row[1]) or {}
+            section_val = p.get("section")
+            if isinstance(section_val, list):
+                section_val = " > ".join(str(x) for x in section_val if x)
+            cur.execute(
+                "INSERT INTO paragraphs_es (rowid, para_id, section, text, title, treaty_committee, "
+                "footnotes_text, footnotes_json) VALUES (?,?,?,?,?,?,?,?)",
+                (row[0], p["id"], section_val, p.get("text") or "",
+                 doc.get("nameShortEs") or doc.get("nameShort") or row[1], row[2],
+                 flatten_footnotes(p), footnotes_json(p)),
+            )
+            inserted_es += 1
+        print(f"[build] {inserted_es} Spanish paragraphs")
+
     # 5) Old jurisprudence paragraph ids -> current ones.
     redirects_path = src / "jur" / "paragraph-redirects.json"
     inserted_redirects = 0
@@ -505,6 +567,7 @@ def build(src: Path, out_db: Path) -> dict:
     # writes after this, but read latency drops by 30-50 % on big corpora.
     print("[build] optimising FTS5 index …")
     cur.execute("INSERT INTO paragraphs_fts(paragraphs_fts) VALUES('optimize')")
+    cur.execute("INSERT INTO paragraphs_fts_es(paragraphs_fts_es) VALUES('optimize')")
     cur.execute("ANALYZE")
     conn.commit()
     conn.close()
@@ -512,6 +575,7 @@ def build(src: Path, out_db: Path) -> dict:
     return {
         "documents": len(docs_by_id),
         "paragraphs": inserted_paragraphs,
+        "paragraphsEs": inserted_es,
         "size_bytes": out_db.stat().st_size,
     }
 
@@ -520,7 +584,7 @@ def write_manifest(out_dir: Path, counts: dict, db_path: Path, *, pretty: bool):
     manifest = {
         "version": datetime.now(timezone.utc).strftime("%Y%m%d"),
         "builtAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "schema": "1.2",
+        "schema": "1.3",
         "tokenizer": "unicode61",
         "fts_columns": ["title", "treaty_committee", "text", "footnotes_text"],
         "counts": counts,
