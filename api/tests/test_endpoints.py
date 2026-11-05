@@ -301,3 +301,59 @@ def test_feedback_unknown_category_buckets_other(client):
     # Categories outside the v19.14 set fall back to "other" silently.
     r = client.post("/api/feedback", json={"kind": "made-up-cat"})
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# lang=es — official Spanish text of General Comment paragraphs
+# ---------------------------------------------------------------------------
+def test_search_es_matches_spanish_text_accent_insensitively(client):
+    r = client.get("/api/search", params={"q": "discriminacion multiple", "lang": "es"}).json()
+    assert r["lang"] == "es" and r["total"] == 1
+    hit = r["hits"][0]
+    assert hit["para_id"] == "crpd-c-gc-6-0002" and hit["lang"] == "es"
+    assert hit["text"].startswith("La discriminación") and "<mark>" in hit["snippet"]
+    assert hit["name_short_es"] == "OG6: Igualdad y no discriminación"
+
+
+def test_search_keeps_accented_words_whole(client):
+    # "discriminación" used to split into "discriminaci" + "n" (ASCII-only tokenizer).
+    r = client.get("/api/search", params={"q": "discriminación múltiple", "lang": "es"}).json()
+    assert r["ftsExpr"] == '"discriminación" "múltiple"' and r["total"] == 1
+    assert client.get("/api/search", params={"q": "discriminaci*", "lang": "es"}).json()["total"] == 1
+
+
+def test_search_es_does_not_match_english_words(client):
+    assert client.get("/api/search", params={"q": "accommodation", "lang": "es"}).json()["total"] == 0
+
+
+def test_search_default_stays_english(client):
+    r = client.get("/api/search", params={"q": "reasonable accommodation"}).json()
+    assert r["total"] >= 1 and all("lang" not in h for h in r["hits"])
+
+
+def test_search_es_without_query_falls_back_to_english(client):
+    r = client.get("/api/search", params={"scope": "gc", "lang": "es"}).json()
+    by_id = {h["para_id"]: h for h in r["hits"]}
+    assert by_id["crpd-c-gc-6-0002"]["lang"] == "es"
+    assert by_id["crpd-c-gc-6-0001"]["lang"] == "en"
+    assert by_id["crpd-c-gc-6-0001"]["text"].startswith("Reasonable accommodation")
+
+
+def test_document_es_mixes_languages_and_keeps_notes_with_their_text(client):
+    r = client.get("/api/document/crpd-c-gc-6", params={"lang": "es"}).json()
+    p1, p2 = r["paragraphs"]
+    assert (p1["lang"], p2["lang"]) == ("en", "es")
+    assert p2["footnotes"] == [{"n": 7, "text": "Véase el artículo 2 de la Convención."}]
+    assert r["document"]["name_short_es"] == "OG6: Igualdad y no discriminación"
+
+
+def test_paragraph_es(client):
+    r = client.get("/api/paragraph/crpd-c-gc-6-0002", params={"lang": "es"}).json()
+    assert r["lang"] == "es" and r["text"].startswith("La discriminación")
+    assert r["footnotes"][0]["n"] == 7 and r["name_es"].startswith("Observación general")
+    jur = client.get("/api/paragraph/crpd-c-34-d-103-2022:2", params={"lang": "es"}).json()
+    assert jur["lang"] == "en" and jur["footnotes"][0]["n"] == 3
+
+
+def test_lang_validates(client):
+    assert client.get("/api/search", params={"q": "x", "lang": "fr"}).status_code == 422
